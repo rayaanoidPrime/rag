@@ -69,7 +69,7 @@ class TxtaiRAGSystem:
         
         return RETURN_SEPARATOR.join(context_parts) # Join with configured separator
 
-    def answer(self, question: str, context_override: Optional[list[str]] = None, stream: bool = False) -> Union[str, Generator[str, None, None]]:
+    def answer(self, question: str, context_override_rich_chunks: Optional[List[Dict[str, Any]]] = None,  stream: bool = False) -> Union[str, Generator[str, None, None]]:
         """
         Generates an answer using the RAG pipeline.
 
@@ -87,7 +87,7 @@ class TxtaiRAGSystem:
             err_msg = "Error: RAG system not ready."
             return err_msg if not stream else (lambda: (yield err_msg))()
 
-        logger.info(f"RAG answering question: '{question}'. Stream: {stream}. Context override: {context_override is not None}. Hybrid search intent: {self.hybrid_search_enabled}")
+        logger.info(f"RAG answering question: '{question}'. Stream: {stream}. Rich context override provided: {context_override_rich_chunks is not None}. Hybrid search intent: {self.hybrid_search_enabled}")
         
         rag_args = {
             "maxlength": LLM_MAX_LENGTH,
@@ -95,43 +95,35 @@ class TxtaiRAGSystem:
         }
 
         final_context_str_for_llm = ""
+        actual_rich_chunks_used: List[Dict[str, Any]] = []
 
-        if context_override is not None:
-            # If context_override is provided (e.g., from GraphRAG), it's expected to be a list of text strings.
-            # We need their corresponding metadata if we want to format them with `format_metadata_for_llm_context`.
-            # The current `GraphRAGBuilder.get_graph_rag_context` returns `graph_rag_data` as list of dicts
-            # `[{"id": original_doc_id, "text": text_content}]`.
-            # We need to adapt this. For now, assume `context_override` contains dicts with "text" and "metadata".
-            # This means `GraphRAGBuilder` needs to return richer objects.
-
-            # Let's assume context_override is now a list of dicts like:
-            # [{"text": "...", "metadata": {...original_chunk_metadata...}}]
-            if context_override and isinstance(context_override[0], dict):
-                 final_context_str_for_llm = self._prepare_context_for_llm(context_override)
-            elif context_override: # Fallback if it's just list of strings (old behavior)
-                 final_context_str_for_llm = RETURN_SEPARATOR.join(context_override)
+        if context_override_rich_chunks is not None:
+            # Context is provided (e.g., from GraphRAG)
+            actual_rich_chunks_used = context_override_rich_chunks
+            if actual_rich_chunks_used:
+                final_context_str_for_llm = self._prepare_context_for_llm(actual_rich_chunks_used)
+            else:
+                 logger.info("Context override was provided but was empty.")
             
-            rag_args["passages"] = final_context_str_for_llm # txtai.RAG takes this as the context string
+            rag_args["passages"] = final_context_str_for_llm
         else:
-            # Perform retrieval using the vector store if no override
-            retrieved_chunks = self.vector_store.search(
+            # Perform retrieval using the vector store
+            retrieved_rich_chunks = self.vector_store.search(
                 query=question, 
                 k=RAG_CONTEXT_SIZE, 
-                hybrid=self.hybrid_search_enabled # Signal intent for hybrid
-            )
-            if retrieved_chunks:
-                final_context_str_for_llm = self._prepare_context_for_llm(retrieved_chunks)
-            else:
-                logger.info("No relevant chunks found by vector store search.")
-                # Let RAG proceed with empty context, it might still answer from its base knowledge or indicate it can't.
+                hybrid=self.hybrid_search_enabled
+            ) # This returns list of {"text": ..., "metadata": ..., "score": ...}
             
-            # Because we've prepared the context string manually, we pass it as `passages`
-            # and txtai.RAG will use it directly instead of doing its own search.
+            actual_rich_chunks_used = retrieved_rich_chunks
+            if actual_rich_chunks_used:
+                final_context_str_for_llm = self._prepare_context_for_llm(actual_rich_chunks_used)
+            else:
+                logger.info("No relevant chunks found by vector store search for RAG.")
+            
             rag_args["passages"] = final_context_str_for_llm
-            # We could also let RAG do its own search and then re-format its output,
-            # but passing passages gives more control. If we pass passages, RAG's own
-            # `context` parameter (number of search results) is ignored.
 
-        # Now, call RAG with the question. It will use the `passages` if provided.
-        # The template {context} will be filled by `final_context_str_for_llm`.
-        return self.rag_pipeline(question, **rag_args)
+        # Call RAG pipeline. It will use `final_context_str_for_llm` in its template.
+        llm_response = self.rag_pipeline(question, **rag_args)
+        
+        # Return both the LLM response and the rich chunks that formed its context
+        return llm_response, actual_rich_chunks_used

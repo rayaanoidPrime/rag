@@ -765,50 +765,57 @@ class AppOrchestrator:
             logger.info("Task executor shut down.")
               
     def process_query(self, user_query: str, kb_id_filter: Optional[str] = None, stream_response: bool = False) -> Dict[str, Any]:
-        """
-        Processes a user query.
-        kb_id_filter: Optional KB ID to restrict search/context. Not yet fully implemented in txtai search.
-        """
         if not self.rag_system:
-            return {"answer": "RAG system is not available.", "type": "error", "graph_image": None}
+            return {"answer": "RAG system is not available.", "type": "error", "graph_image": None, "retrieved_chunks_for_display": []}
 
-        # TODO: If kb_id_filter is provided, how do we pass this to txtai.RAG or txtai.Embeddings.search?
-        # txtai search can take a `where` clause if using SQL backend, or custom filtering logic might be needed.
-        # For GraphRAG, concept searches might also need to be scoped to a KB.
-        # This is a complex part when moving from a single global index to KB-specific contexts
-        # while still using a single txtai.Embeddings instance.
-        # One way is to add a `kb_id` tag/metadata to each item in txtai and filter during search result post-processing
-        # or if txtai allows metadata filtering directly in .search().
-        
-        # For now, the query is global across all data in the txtai vector store.
-        # The GraphRAG is also global.
-        
-        graph_image = None
-        # context_override for RAG system should be list of dicts: [{"text": ..., "metadata": ...}]
-        rag_context_override_list_of_dicts: Optional[List[Dict[str, Any]]] = None
+        graph_image: Optional[PILImage] = None
+        # context_override for RAG system: list of dicts [{"text": ..., "metadata": ...}]
+        rag_context_override_list_of_rich_dicts: Optional[List[Dict[str, Any]]] = None
         final_query_for_llm = user_query
-        response_type = "rag" 
+        response_type = "rag"
+        
+        # This list will hold the rich chunks used for context, for display purposes
+        final_rich_chunks_for_display: List[Dict[str, Any]] = [] 
 
         if self.graph_builder:
-            modified_query, graph_rag_data_list_of_dicts, plot_img = self.graph_builder.get_graph_rag_context(user_query)
-            # graph_rag_data_list_of_dicts is now list of {"text": ..., "metadata": ...}
-            if graph_rag_data_list_of_dicts:
-                rag_context_override_list_of_dicts = graph_rag_data_list_of_dicts
+            modified_query, graph_rag_rich_data_list, plot_img = self.graph_builder.get_graph_rag_context(user_query)
+            # graph_rag_rich_data_list is already list of {"text": ..., "metadata": ...}
+            if graph_rag_rich_data_list:
+                rag_context_override_list_of_rich_dicts = graph_rag_rich_data_list
+                # These are the chunks that will be used by RAG, so they are also for display
+                # Add a score if not present (GraphRAG might not naturally provide a similarity score for path nodes)
+                final_rich_chunks_for_display = [
+                    {**item, "score": item.get("score", 1.0)} for item in graph_rag_rich_data_list # Ensure score exists
+                ]
                 final_query_for_llm = modified_query
                 graph_image = plot_img
                 response_type = "graph_rag"
-                logger.debug(f"GraphRAG context ({len(rag_context_override_list_of_dicts)} items) for query: '{final_query_for_llm}'")
-            else:
-                pass # RAG pipeline will fetch its own context
+                logger.debug(f"GraphRAG context ({len(rag_context_override_list_of_rich_dicts)} items) for query: '{final_query_for_llm}'")
+            # If not a graph query or graph yields no context, rag_context_override_list_of_rich_dicts remains None.
+            # Standard RAG will fetch its own context below.
         
-        # `rag_context_override_list_of_dicts` will be passed to rag_system.answer
-        # TxtaiRAGSystem._prepare_context_for_llm will then format it correctly.
-        answer_content = self.rag_system.answer(
+        # Call the RAG system's answer method
+        llm_answer_content, rich_chunks_used_by_rag = self.rag_system.answer(
             question=final_query_for_llm,
-            context_override=rag_context_override_list_of_dicts, 
+            context_override=rag_context_override_list_of_rich_dicts, # Pass graph context if available
             stream=stream_response
         )
-        return {"answer": answer_content, "type": response_type, "graph_image": graph_image}
+
+        # If standard RAG was used (no GraphRAG override), rich_chunks_used_by_rag will be populated by TxtaiRAGSystem
+        if response_type == "rag" and not rag_context_override_list_of_rich_dicts:
+            final_rich_chunks_for_display = rich_chunks_used_by_rag
+            # Limit for display if too many
+            if len(final_rich_chunks_for_display) > RAG_CONTEXT_SIZE * 2: # Example limit
+                 final_rich_chunks_for_display = final_rich_chunks_for_display[:RAG_CONTEXT_SIZE * 2]
+
+
+        return {
+            "answer": llm_answer_content, 
+            "type": response_type, 
+            "graph_image": graph_image,
+            # Pass the rich chunks used for context (or a subset) to the UI
+            "retrieved_chunks_for_display": final_rich_chunks_for_display 
+        }
 
 
      def get_app_info(self) -> Dict[str, Any]:
@@ -840,7 +847,75 @@ class AppOrchestrator:
     def list_knowledge_bases(self) -> List[Dict[str, Any]]:
         kbs = self.kb_service.list_kbs()
         return [{"id": kb.id, "name": kb.name, "description": kb.description, "doc_count": kb.document_count, "parser_id": kb.parser_id} for kb in kbs]
+    
+    def list_knowledge_bases_detailed(self) -> List[Dict[str, Any]]:
+        kbs = self.kb_service.list_kbs()
+        kb_list_for_ui = []
+        for kb in kbs:
+            # Extract chunking strategy for display (simplified)
+            cfg = kb.parser_config or {}
+            chunk_strat = cfg.get("chunking_strategy", "N/A")
+            kb_list_for_ui.append({
+                "id": kb.id, 
+                "name": kb.name, 
+                "description": kb.description, 
+                "doc_count": kb.document_count,
+                "parser_id": kb.parser_id,
+                "chunking_strategy_display": chunk_strat, # For UI table
+                "embd_model": kb.embd_model,
+                "full_parser_config_json": json.dumps(kb.parser_config, indent=2) # For edit form
+            })
+        return kb_list_for_ui
 
+    def get_documents_for_kb_detailed(self, kb_id: str) -> List[Dict[str, Any]]:
+        # This method already exists in orchestrator as get_documents_for_kb,
+        # ensure it returns enough fields for the DataFrame.
+        docs = self.doc_service.get_documents_by_kb_id(kb_id) # Assuming this is the right service method
+        return [
+            {
+                "id": doc.id, "name": doc.name, "status": doc.status,
+                "progress": f"{doc.progress*100:.1f}%", "file_type": doc.file_type,
+                "file_size": doc.file_size, "chunk_count": doc.chunk_count,
+                "token_count": doc.token_count, "create_time": doc.create_time,
+                # Add total_pages for display if useful here
+            } for doc in docs
+        ]
+
+    def get_document_details_with_artifacts(self, doc_id: str) -> Optional[Dict[str, Any]]:
+        doc = self.doc_service.get_document_by_id(doc_id)
+        if not doc:
+            return None
+        
+        # Convert Peewee model to dict for easier JSON serialization and UI use
+        doc_data = doc.to_dict() # Assuming BaseModel has to_dict()
+        
+        # Ensure layout_analysis_results is included (it should be by to_dict if it's a field)
+        # If layout_analysis_results is a JSONField storing a string, parse it.
+        # If it's already a dict/list from Peewee's JSONField, it's fine.
+        if isinstance(doc_data.get("layout_analysis_results"), str):
+            try:
+                doc_data["layout_analysis_results"] = json.loads(doc_data["layout_analysis_results"])
+            except json.JSONDecodeError:
+                logger.warning(f"Could not parse layout_analysis_results for doc {doc_id}")
+                doc_data["layout_analysis_results"] = None # Or keep as string with a note
+
+        # Convert timestamp if needed
+        if 'create_time' in doc_data and doc_data['create_time']:
+            from app.database import timestamp_ms_to_datetime
+            dt_obj = timestamp_ms_to_datetime(doc_data['create_time'])
+            doc_data['create_time_str'] = dt_obj.strftime('%Y-%m-%d %H:%M:%S') if dt_obj else 'N/A'
+        
+        # Add KB name for context
+        if doc.kb_id:
+            doc_data["kb_name"] = doc.kb_id.name
+            
+        return doc_data
+    
+    # Add this if you want to show active task count on System Info page
+    # def get_active_task_count(self) -> int:
+    #     from app.database.models import Task # Local import
+    #     return Task.select().where(Task.status.in_(["pending", "processing", "queued"])).count()
+    
     def create_knowledge_base(self, name: str, description: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         # kwargs can pass other KB params like embd_model, parser_id, etc.
         try:

@@ -49,64 +49,48 @@ class GraphRAGBuilder:
             original_question or modified_question, [context_list_of_dicts] or None, plot_image or None
         """
         query, concepts = self._parse_graph_query(question)
-        graph_context_data = None
+        graph_context_data = None # This will be list of {"text": "...", "metadata": {...}}
         plot_image = None
-        modified_question = question # By default, question is not modified
+        modified_question = question
 
         if self.embeddings.graph and (query or concepts):
             logger.info(f"Identified graph query. Query: '{query}', Concepts: {concepts}")
             path_query_cypher = self._build_path_query(query, concepts)
             
-            # Build graph network from path query
-            # The `graph=True` parameter returns a `txtai.graph.Graph` instance
             graph_result = self.embeddings.graph.search(path_query_cypher, graph=True)
 
             if graph_result and graph_result.count():
                 logger.info(f"Graph search successful, found {graph_result.count()} nodes initially.")
-                plot_image = self._plot_graph(graph_result) # Plot before deduplication for visualization
+                plot_image = self._plot_graph(graph_result) 
 
-                # Build graph context from nodes
-                # graph_result.scan() iterates over node ids in the graph_result
-                context_nodes = []
+                context_nodes_data = []
                 for node_id_in_graph in list(graph_result.scan()):
-                    # Retrieve original document ID and text stored as attributes
-                    original_doc_id = graph_result.attribute(node_id_in_graph, "id")
-                    # The 'text' attribute should hold the actual text content.
-                    # When data was upserted as a dict {"text": "...", "source": "..."},
-                    # this dict is what's stored if content=True.
-                    # The graph node attribute "text" should point to this dict.
-                    node_data_dict = graph_result.attribute(node_id_in_graph, "text")
+                    # graph_result.attribute(node_id_in_graph, "text") IS THE FULL METADATA DICT
+                    node_metadata_dict = graph_result.attribute(node_id_in_graph, "text")
                     
                     text_content = None
-                    if isinstance(node_data_dict, dict):
-                        text_content = node_data_dict.get("text")
-                    elif isinstance(node_data_dict, str): # Fallback if text was stored directly
-                        text_content = node_data_dict
+                    if isinstance(node_metadata_dict, dict):
+                        text_content = node_metadata_dict.get("text")
+                    elif isinstance(node_metadata_dict, str): 
+                        text_content = node_metadata_dict # Fallback, less ideal
+                        node_metadata_dict = {"text": text_content, "id": graph_result.attribute(node_id_in_graph, "id")} # Create basic metadata
                     
-                    if not text_content and original_doc_id:
-                        # If text is missing, use the original_doc_id as a fallback,
-                        # though this is less ideal.
-                        text_content = str(original_doc_id)
-                        logger.warning(f"Node {node_id_in_graph} (original_id: {original_doc_id}) missing text content, using ID.")
-
                     if text_content:
-                         context_nodes.append({
-                            "id": original_doc_id if original_doc_id else node_id_in_graph,
+                         context_nodes_data.append({
                             "text": text_content,
+                            "metadata": node_metadata_dict, # Pass the whole metadata dict
                          })
                     else:
-                        logger.warning(f"Node {node_id_in_graph} yielded no usable text content.")
+                        logger.warning(f"Node {node_id_in_graph} yielded no usable text content from graph attributes.")
 
-
-                if context_nodes:
-                    graph_context_data = context_nodes
-                    # Default prompt if only concepts were given
+                if context_nodes_data:
+                    graph_context_data = context_nodes_data
                     default_prompt = (
                         "Write a title and text summarizing the context.\n"
                         f"Include the following concepts: {', '.join(concepts)} if they're mentioned in the context."
-                    )
+                    ) if concepts else "Summarize the provided context."
                     modified_question = query if query else default_prompt
-                    logger.info(f"Graph context built with {len(context_nodes)} nodes. Question for LLM: '{modified_question}'")
+                    logger.info(f"Graph context built with {len(context_nodes_data)} nodes. Question for LLM: '{modified_question}'")
                 else:
                     logger.info("No context nodes could be extracted from graph result despite non-empty graph.")
             else:

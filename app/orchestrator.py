@@ -784,27 +784,28 @@ class AppOrchestrator:
         # The GraphRAG is also global.
         
         graph_image = None
-        rag_context_override = None
+        # context_override for RAG system should be list of dicts: [{"text": ..., "metadata": ...}]
+        rag_context_override_list_of_dicts: Optional[List[Dict[str, Any]]] = None
         final_query_for_llm = user_query
         response_type = "rag" 
 
         if self.graph_builder:
-            modified_query, graph_rag_data, plot_img = self.graph_builder.get_graph_rag_context(user_query)
-            if graph_rag_data:
-                rag_context_override = [item["text"] for item in graph_rag_data]
+            modified_query, graph_rag_data_list_of_dicts, plot_img = self.graph_builder.get_graph_rag_context(user_query)
+            # graph_rag_data_list_of_dicts is now list of {"text": ..., "metadata": ...}
+            if graph_rag_data_list_of_dicts:
+                rag_context_override_list_of_dicts = graph_rag_data_list_of_dicts
                 final_query_for_llm = modified_query
                 graph_image = plot_img
                 response_type = "graph_rag"
-                logger.debug(f"GraphRAG context ({len(rag_context_override)} items) for query: '{final_query_for_llm}'")
+                logger.debug(f"GraphRAG context ({len(rag_context_override_list_of_dicts)} items) for query: '{final_query_for_llm}'")
             else:
-                # Standard RAG context logging (example)
-                # search_results = self.vector_store.search(final_query_for_llm, k=RAG_CONTEXT_SIZE)
-                # logger.debug(f"Standard RAG context for query: '{final_query_for_llm}' will be fetched by RAG pipeline.")
                 pass # RAG pipeline will fetch its own context
         
+        # `rag_context_override_list_of_dicts` will be passed to rag_system.answer
+        # TxtaiRAGSystem._prepare_context_for_llm will then format it correctly.
         answer_content = self.rag_system.answer(
             question=final_query_for_llm,
-            context_override=rag_context_override,
+            context_override=rag_context_override_list_of_dicts, 
             stream=stream_response
         )
         return {"answer": answer_content, "type": response_type, "graph_image": graph_image}

@@ -2,15 +2,16 @@ from typing import List, Dict, Any, Optional
 from txtai import Embeddings
 from app.config import (
     VECTOR_DB_PATH,
-    # VECTOR_DB_CLOUD_PROVIDER,
-    # VECTOR_DB_CLOUD_CONTAINER,
     EMBEDDING_MODEL_PATH,
     EMBEDDING_INSTRUCTIONS,
     GRAPH_APPROXIMATE_SEARCH,
     GRAPH_MIN_SCORE,
+    # Add new config for hybrid search if desired
+    TXT_AI_KEYWORD_INDEX_ENABLED, # e.g., True
+    TXT_AI_KEYWORD_CONFIG,      # e.g., {"backend": "sqlite"} or {"backend": "whoosh", "path": "data/keywords"}
 )
 from .base_vector_store import BaseVectorStore
-import streamlit as st # For logger
+import streamlit as st
 import os
 
 logger = st.logger.get_logger(__name__)
@@ -23,22 +24,35 @@ class TxtaiVectorStore(BaseVectorStore):
     """
     def __init__(self, embedder=None): # embedder is for future when we separate embedding generation
         self.embeddings: Optional[Embeddings] = None
-        self._embedder = embedder # Not used yet, txtai.Embeddings handles its own
+        self._embedder = embedder
         self._is_loaded = False
+        self._keyword_index_enabled = TXT_AI_KEYWORD_INDEX_ENABLED # From app.config
+        self._keyword_config = TXT_AI_KEYWORD_CONFIG # From app.config
 
     def _initialize_embeddings(self):
         logger.info("Initializing new txtai Embeddings instance for vector store.")
-        self.embeddings = Embeddings(
-            autoid="uuid5", # As in original
-            path=EMBEDDING_MODEL_PATH, # Path for the embedding model itself
-            instructions=EMBEDDING_INSTRUCTIONS,
-            content=True, # Store content within txtai
-            graph={ # Configure graph capabilities
+        
+        embeddings_config = {
+            "autoid": "uuid5",
+            "path": EMBEDDING_MODEL_PATH,
+            "instructions": EMBEDDING_INSTRUCTIONS,
+            "content": True, # Store content (the full metadata dict)
+            "graph": {
                 "approximate": GRAPH_APPROXIMATE_SEARCH,
                 "minscore": GRAPH_MIN_SCORE,
             },
-        )
-        self._is_loaded = True # Mark as "loaded" because it's newly created
+        }
+        
+        if self._keyword_index_enabled:
+            embeddings_config["keyword"] = True # Enable keyword indexing
+            if self._keyword_config:
+                 embeddings_config["keyword"] = self._keyword_config # Pass specific backend config
+            logger.info(f"Keyword indexing enabled for txtai with config: {embeddings_config['keyword']}")
+        else:
+            logger.info("Keyword indexing disabled for txtai.")
+
+        self.embeddings = Embeddings(**embeddings_config)
+        self._is_loaded = True
 
     def load(self, path: Optional[str] = VECTOR_DB_PATH, cloud_config: Optional[Dict] = None):
         logger.info(f"Attempting to load TxtaiVectorStore from path: {path}, cloud: {cloud_config}")
@@ -87,53 +101,44 @@ class TxtaiVectorStore(BaseVectorStore):
 
     def add_documents(self, documents: List[Dict[str, Any]], embeddings: Optional[List[List[float]]] = None):
         if not self.embeddings:
-            self._initialize_embeddings() # Ensure it's initialized
-            if not self.embeddings: # Still not initialized after attempt
+            self._initialize_embeddings()
+            if not self.embeddings:
                  logger.error("Failed to initialize Embeddings for adding documents.")
                  return
 
-        # txtai's upsert expects list of (id, data, tags) tuples.
-        # 'data' can be text (for auto-embedding) or a precomputed vector.
-        # 'id' from document dict, 'text' from document dict.
-        
         data_to_upsert = []
-        for i, doc in enumerate(documents):
-            doc_id = doc.get("id")
-            doc_text = doc.get("text")
-            doc_source = doc.get("source") # Or other metadata
-
-            if not doc_id:
-                logger.warning(f"Document at index {i} missing 'id', generating one.")
-                doc_id = self.embeddings.config.get("autoid", "uuid5")() # Use configured autoid
-
-            if not doc_text:
-                logger.warning(f"Document '{doc_id}' missing 'text', skipping.")
+        for i, doc_dict in enumerate(documents): # doc_dict is our chunk dict with metadata
+            doc_id = doc_dict.get("id") # This will be None, txtai will generate
+            
+            # The entire doc_dict (which includes "text" and all other metadata)
+            # is passed as the 'data' field to txtai.Embeddings.upsert.
+            # txtai will embed doc_dict["text"].
+            # If keyword=True, txtai will also index doc_dict["text"] for keyword search.
+            
+            if not doc_dict.get("text"):
+                logger.warning(f"Document at index {i} (intended ID: {doc_id}) missing 'text', skipping.")
                 continue
+            
+            # txtai's autoid will handle the first element of the tuple.
+            # The second element is the data to store and from which text is extracted for embedding/keywords.
+            # The third is tags (optional).
+            data_to_upsert.append((doc_id, doc_dict, None))
 
-            # txtai can take precomputed embeddings if data is set to the vector
-            # and then text is passed as a tag or separate metadata field.
-            # For simplicity now, we let txtai handle embedding if not provided.
-            # If embeddings are provided, they should correspond to doc_text.
-            # txtai's upsert handles this if data is the vector.
-            # However, the original code implies upserting text and letting txtai embed.
-            
-            # For now, we pass text directly to txtai for embedding & indexing.
-            # The `content=True` in Embeddings init ensures text is stored.
-            # The 'source' can be stored as a tag or custom attribute.
-            # txtai upsert expects (id, data_dict_or_text_or_vector, tags_tuple_or_None)
-            # If data is a dict, it's stored as metadata. If text, it's embedded.
-            
-            # To store source and other metadata alongside the text for content=True:
-            # We can pass a dictionary as the data field.
-            # txtai will look for a 'text' key in this dict to embed if content=True.
-            # Other keys are stored as attributes.
-            data_item = {"text": doc_text, "source": doc_source}
-            # Add any other metadata from doc to data_item
-            for key, value in doc.items():
-                if key not in ["id", "text", "source"]: # already handled or standard
-                    data_item[key] = value
-            
-            data_to_upsert.append((str(doc_id), data_item, None))
+
+        if data_to_upsert:
+            logger.info(f"Adding/updating {len(data_to_upsert)} documents to TxtaiVectorStore.")
+            self.embeddings.upsert(data_to_upsert)
+            if self._keyword_index_enabled and hasattr(self.embeddings, 'index'):
+                # After upserting, if keywords are enabled, txtai typically builds/updates
+                # its keyword index. For some backends (like manual Whoosh), you might need
+                # to explicitly call index() or ensure it's done on save/load.
+                # With keyword=True and default SQLite FTS, it should handle it.
+                # Calling self.embeddings.index() explicitly can rebuild various indexes.
+                # logger.info("Rebuilding keyword index after upsert (if applicable).")
+                # self.embeddings.index() # This can be slow, use with caution or rely on auto-indexing.
+                pass
+        else:
+            logger.info("No valid documents to add to TxtaiVectorStore.")
 
         if data_to_upsert:
             logger.info(f"Adding/updating {len(data_to_upsert)} documents to TxtaiVectorStore.")
@@ -142,36 +147,47 @@ class TxtaiVectorStore(BaseVectorStore):
             logger.info("No valid documents to add to TxtaiVectorStore.")
 
 
-    def search(self, query: str, k: int = 5, query_embedding: Optional[List[float]] = None) -> List[Dict[str, Any]]:
+    def search(self, query: str, k: int = 5, query_embedding: Optional[List[float]] = None, hybrid: bool = False) -> List[Dict[str, Any]]:
         if not self.embeddings:
             logger.warning("Search called but Embeddings instance not initialized.")
             return []
         
-        # txtai search returns list of dicts with 'id', 'text', 'score'
-        # If query_embedding is provided, txtai doesn't have a direct way to use it
-        # in the .search() method if it also needs to fetch text.
-        # .search() embeds the query string. .similarity() can take raw vectors.
-        # For now, stick to query string for simplicity.
         if query_embedding:
-            logger.warning("Precomputed query_embedding not directly used by TxtaiVectorStore.search, using query string.")
+            logger.warning("Precomputed query_embedding not directly used by TxtaiVectorStore.search, using query string for (hybrid) search.")
+
+        # txtai's search method handles hybrid search automatically if:
+        # 1. `keyword=True` (or keyword config) was set during Embeddings init.
+        # 2. The query string is suitable for both keyword and vector search.
+        # By default, if keyword indexing is on, .search() performs a hybrid query.
+        # The ratio/weighting of keyword vs vector score might be configurable in txtai
+        # or it uses a default fusion method.
+        
+        # The `hybrid` parameter here is more of a signal to log what type of search we *intend*.
+        # `txtai.Embeddings.search` itself determines if it *can* do hybrid.
+        
+        search_type_log = "hybrid" if hybrid and self._keyword_index_enabled and self.embeddings.config.get("keyword") else "vector"
+        logger.info(f"Performing {search_type_log} search for query: '{query}' with k={k}")
 
         results = self.embeddings.search(query, limit=k)
-        # Ensure results match expected format (they usually do from txtai)
-        # txtai search results are like: [{"id": uid, "text": text, "score": score}, ...]
-        # If content=False, 'text' might be missing or be the ID itself.
-        # Since we use content=True and store text in a dict, 'text' should be the actual text content.
-        # The "text" field in the result dict from txtai when content=True and data is a dict
-        # will actually be the dict itself. We need to extract the actual text.
+        
         formatted_results = []
         for res in results:
-            doc_content = res.get("text") # This is the dict we stored
-            text_to_display = doc_content.get("text") if isinstance(doc_content, dict) else doc_content
+            # res["text"] is the full dictionary we stored
+            doc_content_dict = res.get("text") 
+            actual_text = ""
+            metadata_for_formatting = {}
+
+            if isinstance(doc_content_dict, dict):
+                actual_text = doc_content_dict.get("text", "")
+                metadata_for_formatting = doc_content_dict
+            elif isinstance(doc_content_dict, str): # Fallback if somehow only text was stored
+                actual_text = doc_content_dict
+            
             formatted_results.append({
                 "id": res.get("id"),
-                "text": text_to_display,
+                "text": actual_text, # The raw text of the chunk
                 "score": res.get("score"),
-                "source": doc_content.get("source") if isinstance(doc_content, dict) else None
-                # Add other metadata from doc_content if needed
+                "metadata": metadata_for_formatting # Pass the whole metadata dict
             })
         return formatted_results
 

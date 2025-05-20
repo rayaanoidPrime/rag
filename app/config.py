@@ -37,11 +37,18 @@ INITIAL_DATA_PATH = os.environ.get("DATA") # Optional path to data directory to 
 RAG_CONTEXT_SIZE = int(os.environ.get("CONTEXT", 10))
 RAG_SYSTEM_PROMPT = "You are a friendly assistant. You answer questions from users."
 RAG_TEMPLATE = """
-Answer the following question using only the context below. Only include information
-specifically discussed.
+Answer the following question based *only* on the provided context.
+When you use information from a specific part of the context, you **MUST** cite it using the corresponding identifier like [CHUNK_ID] at the end of the sentence or paragraph that uses it.
+For example: "The sky is blue [CHUNK_1]. Photosynthesis requires sunlight [CHUNK_2]."
+If multiple context parts support a statement, cite all relevant ones, e.g., "Water is essential [CHUNK_1][CHUNK_3]."
+Do not make up information. If the context doesn't provide an answer, say so.
 
-question: {question}
-context: {context}
+Context:
+{context}
+
+Question: {question}
+
+Answer:
 """
 
 # Document Processing Configuration
@@ -157,3 +164,18 @@ DEEPDOC_PARALLEL_DEVICES = 1 # Set based on available resources, or use MAX_TASK
 # Max chunks to process from a single parser call in one task segment
 # to prevent memory issues or overly long tasks.
 MAX_CHUNKS_PER_TASK_SEGMENT = 500
+
+RETURN_SEPARATOR = "\n" 
+# Customize these based on what you want to show/hide in LLM context vs keyword search
+METADATA_KEYS_TO_IGNORE_FOR_SEMANTIC_LLM_CONTEXT = ["embedding", "parser_source", "is_table_or_figure", "artifact_image_path"] # For LLM
+METADATA_KEYS_TO_IGNORE_FOR_KEYWORD = ["embedding"]
+
+TXT_AI_HYBRID_SEARCH_ENABLED = True
+TXT_AI_KEYWORD_INDEX_ENABLED = True  # Set to True to enable hybrid search
+# Example for SQLite FTS5 backend (default if keyword=True and no other config)
+TXT_AI_KEYWORD_CONFIG = {"backend": "sqlite", "content": True} 
+# Example for Whoosh backend (requires `pip install txtai[pipeline-text]`)
+# TXT_AI_KEYWORD_CONFIG = {"backend": "whoosh", "path": "data/keyword_index_whoosh"}
+# If using Whoosh, ensure its path directory exists:
+# if TXT_AI_KEYWORD_INDEX_ENABLED and TXT_AI_KEYWORD_CONFIG.get("backend") == "whoosh":
+#     os.makedirs(TXT_AI_KEYWORD_CONFIG["path"], exist_ok=True)

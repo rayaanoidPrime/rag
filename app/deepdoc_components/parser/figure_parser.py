@@ -17,8 +17,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PIL import Image
 
-from rag.app.picture import vision_llm_chunk as picture_vision_llm_chunk
-from rag.prompts import vision_llm_figure_describe_prompt
+from app.deepdoc_components.picture_stub import vision_llm_chunk as picture_vision_llm_chunk
+from app.deepdoc_components.prompts import vision_llm_figure_describe_prompt
 
 
 def vision_figure_parser_figure_data_wraper(figures_data_without_positions):

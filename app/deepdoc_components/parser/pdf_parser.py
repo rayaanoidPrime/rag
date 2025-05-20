@@ -32,13 +32,13 @@ from huggingface_hub import snapshot_download
 from PIL import Image
 from pypdf import PdfReader as pdf2_read
 
-from api import settings
-from api.utils.file_utils import get_project_base_directory
-from deepdoc.vision import OCR, LayoutRecognizer, Recognizer, TableStructureRecognizer
-from rag.app.picture import vision_llm_chunk as picture_vision_llm_chunk
-from rag.nlp import rag_tokenizer
-from rag.prompts import vision_llm_describe_prompt
-from rag.settings import PARALLEL_DEVICES
+from app.config import DEEPDOC_LIGHTEN_MODE as LIGHTEN
+from app.config import MAX_TASK_WORKERS as PARALLEL_DEVICES
+from app.utils.deepdoc_file_utils import get_project_base_directory
+from app.deepdoc_components.vision import OCR, LayoutRecognizer, Recognizer, TableStructureRecognizer
+from app.deepdoc_components.picture_stub import vision_llm_chunk as picture_vision_llm_chunk
+from app.utils.rag_nlp_stubs import rag_tokenizer_instance as rag_tokenizer
+from app.deepdoc_components.prompts import vision_llm_describe_prompt
 
 LOCK_KEY_pdfplumber = "global_shared_lock_pdfplumber"
 if LOCK_KEY_pdfplumber not in sys.modules:
@@ -71,7 +71,7 @@ class RAGFlowPdfParser:
         self.tbl_det = TableStructureRecognizer()
 
         self.updown_cnt_mdl = xgb.Booster()
-        if not settings.LIGHTEN:
+        if not LIGHTEN:
             try:
                 import torch.cuda
                 if torch.cuda.is_available():
@@ -93,6 +93,8 @@ class RAGFlowPdfParser:
                 model_dir, "updown_concat_xgb.model"))
 
         self.page_from = 0
+        self.page_from_init = 0 # Can be overridden if needed during init phase
+        self.page_to_init = 100000000 # Default to a large number
 
     def __char_width(self, c):
         return (c["x1"] - c["x0"]) // max(len(c["text"]), 1)
@@ -146,7 +148,7 @@ class RAGFlowPdfParser:
             True if re.search(
                 r"([。？！；!?;+)）]|[a-z]\.)$",
                 up["text"]) else False,
-            True if re.search(r"[，：‘“、0-9（+-]$", up["text"]) else False,
+            True if re.search(r"[，：'“、0-9（+-]$", up["text"]) else False,
             True if re.search(
                 r"(^.?[/,?;:\]，。；：’”？！》】）-])",
                 down["text"]) else False,
@@ -443,9 +445,9 @@ class RAGFlowPdfParser:
                 bxs.pop(i)
                 continue
             concatting_feats = [
-                b["text"].strip()[-1] in ",;:'\"，、‘“；：-",
+                b["text"].strip()[-1] in ",;:'\"，、'“；：-",
                 len(b["text"].strip()) > 1 and b["text"].strip(
-                )[-2] in ",;:'\"，‘“、；：",
+                )[-2] in ",;:'\"，'“、；：",
                 b_["text"].strip() and b_["text"].strip()[0] in "。；？！?”）),，、：",
             ]
             # features for not concating
@@ -1000,8 +1002,8 @@ class RAGFlowPdfParser:
         except Exception:
             logging.exception("total_page_number")
 
-    def __images__(self, fnm, zoomin=3, page_from=0,
-                   page_to=299, callback=None):
+     def __images__(self, fnm, zoomin=3, page_from=0,
+                   page_to=100000000, callback=None): # Ensure page_to has a large default if not passed
         self.lefted_chars = []
         self.mean_height = []
         self.mean_width = []
@@ -1009,108 +1011,160 @@ class RAGFlowPdfParser:
         self.garbages = {}
         self.page_cum_height = [0]
         self.page_layout = []
-        self.page_from = page_from
-        start = timer()
+        self.page_from = page_from # Store the actual page_from used for this run
+        start_time = timer() # Renamed from 'start' to avoid conflict
+        
         try:
             with sys.modules[LOCK_KEY_pdfplumber]:
-                with (pdfplumber.open(fnm) if isinstance(fnm, str) else pdfplumber.open(BytesIO(fnm))) as pdf:
-                    self.pdf = pdf
-                    self.page_images = [p.to_image(resolution=72 * zoomin, antialias=True).annotated for i, p in
-                                        enumerate(self.pdf.pages[page_from:page_to])]
+                # Open the PDF
+                pdf_handle = pdfplumber.open(fnm) if isinstance(fnm, str) else pdfplumber.open(BytesIO(fnm))
+                
+                self.total_page = len(pdf_handle.pages)
+                
+                # Adjust page_to if it's -1 (meaning all pages) or out of bounds
+                # The page_to for slicing should be exclusive upper bound for list slicing,
+                # but for pdfplumber's page iteration, it's often inclusive index or count.
+                # Let's assume page_to is 0-indexed inclusive for RAGFlowPdfParser logic
+                actual_page_to = page_to
+                if actual_page_to == -1 or actual_page_to >= self.total_page:
+                    actual_page_to = self.total_page # Convert to exclusive for slicing
+                else:
+                    actual_page_to = actual_page_to + 1 # Convert 0-indexed inclusive to exclusive for slicing
+                
+                # Ensure page_from is within bounds
+                actual_page_from = max(0, page_from)
+                actual_page_from = min(actual_page_from, self.total_page -1 if self.total_page > 0 else 0)
 
+                if actual_page_from >= actual_page_to and self.total_page > 0 : # If range is invalid
+                    logging.warning(f"PDF Parser: Invalid page range for {fnm}. From: {page_from}, To: {page_to}, Total: {self.total_page}. No pages will be processed.")
+                    self.page_images = []
+                    self.page_chars = []
+                elif self.total_page == 0:
+                    logging.warning(f"PDF Parser: PDF {fnm} has 0 pages.")
+                    self.page_images = []
+                    self.page_chars = []
+                else:
+                    logging.info(f"PDF Parser: Processing pages {actual_page_from} to {actual_page_to-1} (0-indexed inclusive) for {fnm}")
+                    self.page_images = [
+                        p.to_image(resolution=72 * zoomin, antialias=True).annotated 
+                        for i, p in enumerate(pdf_handle.pages[actual_page_from:actual_page_to]) # Python slice is exclusive for end
+                    ]
                     try:
-                        self.page_chars = [[c for c in page.dedupe_chars().chars if self._has_color(c)] for page in self.pdf.pages[page_from:page_to]]
+                        self.page_chars = [
+                            [c for c in page.dedupe_chars().chars if self._has_color(c)] 
+                            for page in pdf_handle.pages[actual_page_from:actual_page_to]
+                        ]
                     except Exception as e:
-                        logging.warning(f"Failed to extract characters for pages {page_from}-{page_to}: {str(e)}")
-                        self.page_chars = [[] for _ in range(page_to - page_from)]  # If failed to extract, using empty list instead.
+                        logging.warning(f"Failed to extract characters for pages {actual_page_from}-{actual_page_to-1}: {str(e)}")
+                        self.page_chars = [[] for _ in range(len(self.page_images))]
+                
+                pdf_handle.close() # Close the pdfplumber handle
 
-                    self.total_page = len(self.pdf.pages)
+        except Exception as e_main:
+            logging.exception(f"RAGFlowPdfParser __images__ error for {fnm}: {e_main}")
+            self.page_images = [] # Ensure these are empty on error
+            self.page_chars = []
+            self.total_page = 0
 
-        except Exception:
-            logging.exception("RAGFlowPdfParser __images__")
-        logging.info(f"__images__ dedupe_chars cost {timer() - start}s")
+        logging.info(f"__images__ loading & initial char extraction cost {timer() - start_time}s for {len(self.page_images)} pages.")
 
+        # Outlines processing (keep as is, it processes the whole document's outline)
         self.outlines = []
         try:
-            with (pdf2_read(fnm if isinstance(fnm, str)
-                            else BytesIO(fnm))) as pdf:
-                self.pdf = pdf
-
-                outlines = self.pdf.outline
-                def dfs(arr, depth):
+            with (pdf2_read(fnm if isinstance(fnm, str) else BytesIO(fnm))) as pdf_outline_handle:
+                outlines_raw = pdf_outline_handle.outline
+                def dfs_outlines(arr, depth): # Renamed dfs to avoid conflict
                     for a in arr:
-                        if isinstance(a, dict):
-                            self.outlines.append((a["/Title"], depth))
-                            continue
-                        dfs(a, depth + 1)
+                        if isinstance(a, dict): self.outlines.append((a["/Title"], depth))
+                        else: dfs_outlines(a, depth + 1)
+                dfs_outlines(outlines_raw, 0)
+        except Exception as e_outline:
+            logging.warning(f"Outlines exception: {e_outline}")
+        if not self.outlines: logging.warning("Miss outlines")
 
-                dfs(outlines, 0)
 
-        except Exception as e:
-            logging.warning(f"Outlines exception: {e}")
+        # The rest of __images__ method (is_english, OCR launching) should now operate
+        # on the correctly sliced self.page_images and self.page_chars.
+        # Crucially, page numbers in OCR results (b["page_number"]) will be relative
+        # to the slice (0 to N-1). We need to adjust them back to absolute page numbers
+        # if the final output includes page numbers.
+        # The `self._line_tag` method uses `bx["page_number"]` and `self.page_from`.
+        # The `self.page_from` here is the one passed to `__images__`.
 
-        if not self.outlines:
-            logging.warning("Miss outlines")
+        # Check if page_chars has same length as page_images for safety
+        if len(self.page_chars) != len(self.page_images):
+            logging.error(f"Mismatch between page_images ({len(self.page_images)}) and page_chars ({len(self.page_chars)}) lengths. Resetting page_chars.")
+            self.page_chars = [[] for _ in range(len(self.page_images))]
 
-        logging.debug("Images converted.")
-        self.is_english = [re.search(r"[a-zA-Z0-9,/¸;:'\[\]\(\)!@#$%^&*\"?<>._-]{30,}", "".join(
-            random.choices([c["text"] for c in self.page_chars[i]], k=min(100, len(self.page_chars[i]))))) for i in
-            range(len(self.page_chars))]
-        if sum([1 if e else 0 for e in self.is_english]) > len(
-                self.page_images) / 2:
-            self.is_english = True
-        else:
-            self.is_english = False
+
+        # ... (rest of __images__ method: is_english, __img_ocr_launcher, etc.)
+        # Make sure any references to page numbers within this method are correctly offset
+        # if they need to be absolute. For example, `self.mean_height[pagenum-1]`
+        # If `pagenum` is 0-indexed from the slice, this is fine.
+        # `bxs[ii]["page_number"] = pagenum` should be fine (relative index)
+        # `self.boxes[i]["page_number"]` is used for cum_height lookups.
+        # The `self.page_cum_height` is built based on `self.page_images` which is already sliced.
+        # So, `self.boxes[i]["page_number"]` refers to the index within the *processed slice*.
+        # The `_line_tag` method correctly uses `self.page_from` to adjust this.
+        
+        # Initialize mean_height and mean_width based on the actual number of pages being processed
+        num_processed_pages = len(self.page_images)
+        self.mean_height = [0] * num_processed_pages
+        self.mean_width = [8] * num_processed_pages # Default value
 
         async def __img_ocr(i, id, img, chars, limiter):
             j = 0
-            while j + 1 < len(chars):
-                if chars[j]["text"] and chars[j + 1]["text"] \
-                        and re.match(r"[0-9a-zA-Z,.:;!%]+", chars[j]["text"] + chars[j + 1]["text"]) \
-                        and chars[j + 1]["x0"] - chars[j]["x1"] >= min(chars[j + 1]["width"],
-                                                                       chars[j]["width"]) / 2:
-                    chars[j]["text"] += " "
+            while j + 1 < len(local_chars): # Use local_chars
+                if local_chars[j]["text"] and local_chars[j + 1]["text"] \
+                        and re.match(r"[0-9a-zA-Z,.:;!%]+", local_chars[j]["text"] + local_chars[j + 1]["text"]) \
+                        and local_chars[j + 1]["x0"] - local_chars[j]["x1"] >= min(local_chars[j + 1]["width"],
+                                                                        local_chars[j]["width"]) / 2:
+                    local_chars[j]["text"] += " "
                 j += 1
 
             if limiter:
                 async with limiter:
-                    await trio.to_thread.run_sync(lambda: self.__ocr(i + 1, img, chars, zoomin, id))
+                    await trio.to_thread.run_sync(lambda: self.__ocr(i + 1, img, local_chars, zoomin, id)) # Pass local_chars
             else:
-                self.__ocr(i + 1, img, chars, zoomin, id)
+                self.__ocr(i + 1, img, local_chars, zoomin, id) # Pass local_chars
 
             if callback and i % 6 == 5:
-                callback(prog=(i + 1) * 0.6 / len(self.page_images), msg="")
+                callback(prog=(i + 1) * 0.6 / max(1, len(self.page_images)), msg="")
 
-        async def __img_ocr_launcher():
-            def __ocr_preprocess():
-                chars = self.page_chars[i] if not self.is_english else []
-                self.mean_height.append(
-                    np.median(sorted([c["height"] for c in chars])) if chars else 0
-                )
-                self.mean_width.append(
-                    np.median(sorted([c["width"] for c in chars])) if chars else 8
-                )
-                self.page_cum_height.append(img.size[1] / zoomin)
-                return chars
+         async def __img_ocr_launcher():
+            def __ocr_preprocess(idx, current_img): # Pass index and current_img
+                # Use self.page_chars[idx] for the current page's characters
+                current_page_chars = self.page_chars[idx] if idx < len(self.page_chars) else []
+                
+                # Ensure mean_height and mean_width arrays are correctly sized for current batch
+                if idx < len(self.mean_height):
+                    self.mean_height[idx] = np.median(sorted([c["height"] for c in current_page_chars])) if current_page_chars else 0
+                if idx < len(self.mean_width):
+                    self.mean_width[idx] = np.median(sorted([c["width"] for c in current_page_chars])) if current_page_chars else 8
+                
+                # page_cum_height is built iteratively
+                if idx < len(self.page_images): # Ensure img exists
+                     self.page_cum_height.append(self.page_images[idx].size[1] / zoomin) # Use self.page_images[idx]
+
+                return current_page_chars
 
             if self.parallel_limiter:
                 async with trio.open_nursery() as nursery:
-                    for i, img in enumerate(self.page_images):
-                        chars = __ocr_preprocess()
-
-                        nursery.start_soon(__img_ocr, i, i % PARALLEL_DEVICES, img, chars,
+                    for i, img_item in enumerate(self.page_images):
+                        chars_for_page = __ocr_preprocess(i, img_item)
+                        nursery.start_soon(__img_ocr, i, i % PARALLEL_DEVICES, img_item, chars_for_page,
                                            self.parallel_limiter[i % PARALLEL_DEVICES])
                         await trio.sleep(0.1)
             else:
-                for i, img in enumerate(self.page_images):
-                    chars = __ocr_preprocess()
-                    await __img_ocr(i, 0, img, chars, None)
-
-        start = timer()
-
+                for i, img_item in enumerate(self.page_images):
+                    chars_for_page = __ocr_preprocess(i, img_item)
+                    await __img_ocr(i, 0, img_item, chars_for_page, None)
+        
+        # Before running trio, ensure page_cum_height is reset correctly for THIS batch
+        self.page_cum_height = [0] # Reset for the current call to __images__
+        start_ocr_launch_time = timer()
         trio.run(__img_ocr_launcher)
-
-        logging.info(f"__images__ {len(self.page_images)} pages cost {timer() - start}s")
+        logging.info(f"__images__ OCR launcher cost {timer() - start_ocr_launch_time}s for {len(self.page_images)} pages")
 
         if not self.is_english and not any(
                 [c for c in self.page_chars]) and self.boxes:
@@ -1122,20 +1176,58 @@ class RAGFlowPdfParser:
 
         self.page_cum_height = np.cumsum(self.page_cum_height)
         assert len(self.page_cum_height) == len(self.page_images) + 1
-        if len(self.boxes) == 0 and zoomin < 9:
-            self.__images__(fnm, zoomin * 3, page_from, page_to, callback)
+        if len(self.boxes) == 0 and zoomin < 9 and len(self.page_images) > 0 : # Added check for page_images
+            self.__images__(fnm, zoomin * 3, page_from, page_to, callback) # Pass page_from, page_to
+        
+        # Ensure cum_height is correct size if pages were processed
+        if len(self.page_images) > 0:
+            self.page_cum_height = np.cumsum(self.page_cum_height)
+            # Ensure it has one more element than page_images if pages were processed
+            if len(self.page_cum_height) != len(self.page_images) + 1:
+                 # This can happen if self.page_images was empty, page_cum_height = [0] -> cumsum([0]) = [0]
+                 # which is not len(page_images) + 1.
+                 # If page_images is empty, page_cum_height should remain [0] or be empty depending on downstream use.
+                 # For safety, if page_images is empty, let's ensure page_cum_height reflects that it's for zero pages.
+                 if not self.page_images:
+                     self.page_cum_height = np.array([0]) # Or handle as error / special case
+                 else: # Mismatch for non-empty pages, log error
+                     logging.error(f"page_cum_height length mismatch. Expected {len(self.page_images)+1}, Got {len(self.page_cum_height)}")
+                     # Potentially re-initialize or raise error.
+                     # For now, this indicates an issue in page_cum_height accumulation logic.
 
-    def __call__(self, fnm, need_image=True, zoomin=3, return_html=False):
-        self.__images__(fnm, zoomin)
+
+ def __call__(self, fnm, from_page=0, to_page=100000000, need_image=True, zoomin=3, return_html=False):        self.__images__(fnm, zoomin)
+        # Pass from_page and to_page to __images__
+        # Note: RAGFlowPdfParser's to_page is 0-indexed inclusive for its logic,
+        # while Task objects might store -1 for "to end".
+        # The __images__ method handles large to_page by capping at total_pages.
+        self.__images__(fnm, zoomin, page_from=from_page, page_to=to_page)
+        
+        if not self.page_images: # If no pages were processed (e.g. invalid range, 0-page PDF)
+            logging.warning(f"PDF Parser: No pages processed for {fnm} with range {from_page}-{to_page}. Returning empty.")
+            return [], []
+
+        
         self._layouts_rec(zoomin)
         self._table_transformer_job(zoomin)
         self._text_merge()
         self._concat_downward()
         self._filter_forpages()
-        tbls = self._extract_table_figure(
-            need_image, zoomin, return_html, False)
-        return self.__filterout_scraps(deepcopy(self.boxes), zoomin), tbls
-
+        tbls_figs = self._extract_table_figure(
+            need_image, zoomin, return_html, False) # False for need_position here
+        
+        processed_texts = self.__filterout_scraps(deepcopy(self.boxes), zoomin)
+        final_text_sections = []
+        if processed_texts: # If it's a single string, split by double newline
+            for section_text_with_tag in processed_texts.split("\n\n"):
+                if section_text_with_tag.strip():
+                    # For now, just take the text, ignore the tag for simplicity in C2.
+                    # Proper tag parsing would extract position data.
+                    clean_text = self.remove_tag(section_text_with_tag)
+                    final_text_sections.append((clean_text, "parsed_text_section")) # (text, style_placeholder)
+        
+        return final_text_sections, tbls_figs
+        
     def remove_tag(self, txt):
         return re.sub(r"@@[\t0-9.-]+?##", "", txt)
 

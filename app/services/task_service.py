@@ -6,9 +6,8 @@ from peewee import DoesNotExist
 
 from app.database import DB
 from app.database.models import Task, Document, KnowledgeBase
-from app.utils.file_utils import FileType # Assuming FileType enum is in file_utils
-from app.config import MAX_TASK_WORKERS # For thread pool later
-
+from app.utils.file_utils import FileType , get_pdf_page_count # Assuming FileType enum is in file_utils
+from app.config import MAX_TASK_WORKERS, PARSER_MAPPING, DEEPDOC_PARSER_BY_FILE_TYPE, DEFAULT_PARSER_ID
 # Import specific parser logic if needed for task breakdown (e.g., PDF page count)
 # For now, we'll keep it generic or assume info is in doc.parser_config
 # from app.document_processing.txtai_parser import TxtaiDocumentParser # Example
@@ -81,83 +80,106 @@ class TaskService:
     def delete_tasks_for_document(doc_id: str):
         deleted_count = Task.delete().where(Task.doc_id == doc_id).execute()
         logger.info(f"Deleted {deleted_count} tasks for document ID '{doc_id}'.")
+@staticmethod
+    @DB.connection_context()
+    def get_tasks_for_document(doc_id: str, status: Optional[str] = None) -> List[Task]:
+        """Helper to get tasks for a document, optionally filtered by status."""
+        query = Task.select().where(Task.doc_id == doc_id)
+        if status:
+            query = query.where(Task.status == status)
+        return list(query)
 
-
-     @staticmethod
+    @staticmethod
     @DB.connection_context()
     def create_processing_tasks_for_document(doc: Document) -> List[Task]:
-        # ... (initial checks for doc and kb) ...
-        kb = doc.kb_id 
-        parser_config_from_kb = kb.parser_config if kb else {}
-        doc_file_type = doc.file_type
-        # Get the actual parser ID configured for this KB
-        kb_parser_id_setting = kb.parser_id # e.g., 'naive', 'deepdoc' (future)
+        if not doc or not doc.kb_id:
+            logger.error(f"Cannot create tasks: Document {getattr(doc, 'id', 'N/A')} or its KB is invalid.")
+            return []
+
+        kb = doc.kb_id
+        parser_config_from_kb = kb.parser_config or {}
+        doc_file_type_str = doc.file_type # e.g., "pdf", "docx"
+
+        # Determine the actual parser_id and its page-awareness
+        effective_parser_id = kb.parser_id or DEFAULT_PARSER_ID
+        is_parser_page_aware = False
+
+        if effective_parser_id == "deepdoc_auto":
+            resolved_parser_key = DEEPDOC_PARSER_BY_FILE_TYPE.get(doc_file_type_str.lower())
+            if resolved_parser_key:
+                parser_info = PARSER_MAPPING.get(resolved_parser_key, {})
+                is_parser_page_aware = parser_info.get("is_page_aware", False)
+                effective_parser_id = resolved_parser_key # Update for logging
+            else: # Fallback for deepdoc_auto if file type not in DEEPDOC_PARSER_BY_FILE_TYPE
+                parser_info = PARSER_MAPPING.get("naive_txtai", {}) # Default fallback
+                is_parser_page_aware = parser_info.get("is_page_aware", False)
+                effective_parser_id = "naive_txtai"
+        else:
+            parser_info = PARSER_MAPPING.get(effective_parser_id, {})
+            is_parser_page_aware = parser_info.get("is_page_aware", False)
+        
+        logger.info(f"For Doc {doc.id} (type: {doc_file_type_str}), effective parser_id: '{effective_parser_id}', page_aware: {is_parser_page_aware}")
 
         created_tasks_in_db = []
 
-        # --- IF CURRENT PARSER (e.g., TxtaiDocumentParser) IS NOT PAGE-AWARE ---
-        # And we are using a parser like our current TxtaiDocumentParser ('naive' might map to this)
-        # that processes the whole file regardless of page ranges.
-        # For such parsers, we should only create ONE task for the whole document to avoid duplication.
-        
-        # This is a temporary check. Ideally, parsers would declare their capabilities.
-        # Assuming 'naive' is our TxtaiDocumentParser or similar non-page-aware.
-        IS_PARSER_PAGE_AWARE = False # Default to false
-        if kb_parser_id_setting == "deepdoc": # Placeholder for when DeepDoc is integrated
-            IS_PARSER_PAGE_AWARE = True
-        
-        # If the document is a PDF AND the configured parser is page-aware AND there are page settings:
-        if doc_file_type == FileType.PDF.value and IS_PARSER_PAGE_AWARE:
-            task_page_size = parser_config_from_kb.get("task_page_size", 0)
-            page_ranges_config = parser_config_from_kb.get("pages")
+        # If the document is a PDF AND the configured parser is page-aware:
+        if doc_file_type_str == FileType.PDF.value and is_parser_page_aware:
+            task_page_size = int(parser_config_from_kb.get("task_page_size", 0)) # Ensure int
+            page_ranges_config = parser_config_from_kb.get("pages") # List of [start, end] (1-indexed)
 
-            if page_ranges_config and isinstance(page_ranges_config, list):
+            total_pages = get_pdf_page_count(doc.file_path)
+            if total_pages == 0:
+                logger.warning(f"PDF {doc.id}: Could not determine total page count. Creating a single task for the whole document.")
+                db_task = TaskService.create_task_in_db(doc.id, from_page=0, to_page=-1) # 0-indexed, -1 for all
+                created_tasks_in_db.append(db_task)
+            elif page_ranges_config and isinstance(page_ranges_config, list):
                 logger.info(f"PDF {doc.id} with page-aware parser: Using page ranges from config: {page_ranges_config}")
-                for start_page, end_page in page_ranges_config:
-                    from_p = max(0, int(start_page) - 1)
-                    to_p = int(end_page) - 1 
+                for start_page_1_idx, end_page_1_idx in page_ranges_config:
+                    # Convert 1-indexed from config to 0-indexed for tasks
+                    from_p_0_idx = max(0, int(start_page_1_idx) - 1)
+                    to_p_0_idx = min(int(end_page_1_idx) - 1, total_pages - 1) # Cap at actual last page
+
+                    if from_p_0_idx > to_p_0_idx:
+                        logger.warning(f"PDF {doc.id}: Invalid page range [{start_page_1_idx}-{end_page_1_idx}] skipped.")
+                        continue
                     
-                    if task_page_size > 0:
-                        current_sub_page = from_p
-                        while current_sub_page <= to_p:
-                            sub_to_page = min(current_sub_page + task_page_size - 1, to_p)
-                            db_task = TaskService.create_task_in_db(doc.id, current_sub_page, sub_to_page)
+                    if task_page_size > 0: # Further split this range by task_page_size
+                        current_sub_page_0_idx = from_p_0_idx
+                        while current_sub_page_0_idx <= to_p_0_idx:
+                            sub_to_page_0_idx = min(current_sub_page_0_idx + task_page_size - 1, to_p_0_idx)
+                            db_task = TaskService.create_task_in_db(doc.id, current_sub_page_0_idx, sub_to_page_0_idx)
                             created_tasks_in_db.append(db_task)
-                            current_sub_page = sub_to_page + 1
-                    else:
-                        db_task = TaskService.create_task_in_db(doc.id, from_p, to_p)
+                            current_sub_page_0_idx = sub_to_page_0_idx + 1
+                    else: # Process the whole configured range as one task
+                        db_task = TaskService.create_task_in_db(doc.id, from_p_0_idx, to_p_0_idx)
                         created_tasks_in_db.append(db_task)
             elif task_page_size > 0:
-                # TODO: Need total page count for the PDF to use task_page_size effectively without explicit ranges.
-                # This would require a lightweight PDF page count utility callable here or info stored on Document.
-                logger.warning(f"PDF {doc.id}: task_page_size defined but no explicit page_ranges and no total page count available. Creating single task.")
-                db_task = TaskService.create_task_in_db(doc.id, from_page=0, to_page=-1)
-                created_tasks_in_db.append(db_task)
+                logger.info(f"PDF {doc.id} with page-aware parser: Splitting by task_page_size: {task_page_size}")
+                current_page_0_idx = 0
+                while current_page_0_idx < total_pages:
+                    to_p_0_idx = min(current_page_0_idx + task_page_size - 1, total_pages - 1)
+                    db_task = TaskService.create_task_in_db(doc.id, current_page_0_idx, to_p_0_idx)
+                    created_tasks_in_db.append(db_task)
+                    current_page_0_idx = to_p_0_idx + 1
             else:
-                logger.info(f"PDF {doc.id} with page-aware parser: No specific page ranges/size. Creating single task.")
-                db_task = TaskService.create_task_in_db(doc.id, from_page=0, to_page=-1)
+                logger.info(f"PDF {doc.id} with page-aware parser: No specific page ranges/size. Creating single task for all {total_pages} pages.")
+                db_task = TaskService.create_task_in_db(doc.id, from_page=0, to_page=total_pages -1 if total_pages > 0 else -1)
                 created_tasks_in_db.append(db_task)
         else:
             # For non-PDFs, or PDFs with non-page-aware parsers, or if no page splitting is configured:
             # Create one task for the whole document.
-            if doc_file_type == FileType.PDF.value and not IS_PARSER_PAGE_AWARE:
-                 logger.info(f"PDF {doc.id} with NON-page-aware parser ('{kb_parser_id_setting}'). Creating single task for whole document to avoid duplication.")
-            else:
-                logger.info(f"Document {doc.id} (type: {doc_file_type}, parser: '{kb_parser_id_setting}'): Creating single processing task.")
+            log_reason = "non-PDF" if doc_file_type_str != FileType.PDF.value else f"parser '{effective_parser_id}' not page-aware or no page splitting defined"
+            logger.info(f"Document {doc.id} (type: {doc_file_type_str}, reason: {log_reason}): Creating single processing task for whole document.")
             db_task = TaskService.create_task_in_db(doc.id, from_page=0, to_page=-1)
             created_tasks_in_db.append(db_task)
 
         if created_tasks_in_db:
-            from app.services.document_service import DocumentService 
+            from app.services.document_service import DocumentService # Local import to avoid circularity
             DocumentService.update_document_status(doc.id, status="queued", progress=0.05)
-        
-        return created_tasks_in_db
+        else:
+             logger.warning(f"No tasks were created for document {doc.id}. This might indicate an issue with configuration or PDF page count.")
+             from app.services.document_service import DocumentService
+             DocumentService.update_document_status(doc.id, status="failed", error_message="Task creation failed (e.g. PDF page count error or invalid page ranges).")
 
-    # RAGflow's `reuse_prev_task_chunks` and digest logic is complex and depends on how
-    # chunks are identified and stored. We'll skip this optimization for now.
-    # If implemented, it would involve:
-    # 1. Calculating a `digest` for task parameters (doc_id, pages, parser_config).
-    # 2. When creating new tasks, check if a completed task with the same digest exists.
-    # 3. If so, link the new document to the existing chunks instead of re-processing.
-    # This requires chunks to be stored independently of documents in the vector store,
-    # or a robust way to copy/reference them.
+
+        return created_tasks_in_db

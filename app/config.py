@@ -98,3 +98,62 @@ DEFAULT_KB_VECTOR_WEIGHT = 0.3 # From RAGflow
 # For Task Processing (simplified from RAGflow's Redis queue)
 # We might use ThreadPoolExecutor initially
 MAX_TASK_WORKERS = int(os.environ.get("MAX_TASK_WORKERS", 4))
+
+# --- Parser Configuration ---
+DEFAULT_PARSER_ID = "naive_txtai" # Default if not specified by KB
+
+# PARSER_MAPPING maps a KnowledgeBase.parser_id to a parser class and its type
+# 'type' can be 'naive' (like TxtaiDocumentParser) or 'deepdoc'
+PARSER_MAPPING = {
+    "naive_txtai": {"class_path": "app.document_processing.txtai_parser.TxtaiDocumentParser", "type": "naive", "is_page_aware": False},
+    
+    "deepdoc_pdf": {"class_path": "app.deepdoc_components.parser.pdf_parser.RAGFlowPdfParser", "type": "deepdoc", "is_page_aware": True},
+    "deepdoc_docx": {"class_path": "app.deepdoc_components.parser.docx_parser.RAGFlowDocxParser", "type": "deepdoc", "is_page_aware": True},
+    "deepdoc_excel": {"class_path": "app.deepdoc_components.parser.excel_parser.RAGFlowExcelParser", "type": "deepdoc", "is_page_aware": False}, # Excel usually sheet-based, not page
+    "deepdoc_ppt": {"class_path": "app.deepdoc_components.parser.ppt_parser.RAGFlowPptParser", "type": "deepdoc", "is_page_aware": True},
+    "deepdoc_txt": {"class_path": "app.deepdoc_components.parser.txt_parser.RAGFlowTxtParser", "type": "deepdoc", "is_page_aware": False},
+    "deepdoc_md": {"class_path": "app.deepdoc_components.parser.markdown_parser.RAGFlowMarkdownParser", "type": "deepdoc", "is_page_aware": False},
+    "deepdoc_html": {"class_path": "app.deepdoc_components.parser.html_parser.RAGFlowHtmlParser", "type": "deepdoc", "is_page_aware": False},
+    "deepdoc_json": {"class_path": "app.deepdoc_components.parser.json_parser.RAGFlowJsonParser", "type": "deepdoc", "is_page_aware": False},
+    
+    "deepdoc_auto": {"type": "deepdoc_auto", "is_page_aware": None}, # Page-awareness determined by resolved parser
+}
+
+# Mapping file extensions to their default deepdoc parser_id (if using 'deepdoc_auto')
+DEEPDOC_PARSER_BY_FILE_TYPE = {
+    "pdf": "deepdoc_pdf",
+    "docx": "deepdoc_docx",
+    "xlsx": "deepdoc_excel",
+    "pptx": "deepdoc_ppt",
+    "txt": "deepdoc_txt",
+    "md": "deepdoc_md",
+    "html": "deepdoc_html",
+    "htm": "deepdoc_html",
+    "json": "deepdoc_json",
+    # Note: CSV is handled by excel_parser in RAGFlow, map it if needed.
+    # For 'other' file types, 'deepdoc_auto' might fall back to naive or raise error.
+}
+
+
+DEFAULT_PARSER_CONFIG = {
+    "pages": [[1, 1000000]], # Default for PDF if using deepdoc
+    "layout_recognize": True, # Default for deepdoc PDF
+    "pdf_parser_options": { # Specific options for RAGFlowPdfParser
+        "need_image": False, # Set to False to avoid figure/table image extraction initially
+        "zoomin": 3,
+        "return_html_tables": True # Get HTML for tables for easier text conversion
+    },
+    "txt_parser_options": { # Specific options for RAGFlowTxtParser
+        "chunk_token_num": 256, # Example
+        "delimiter": "\n!?;。；！？"
+    },
+    # Add other parser default configs as needed
+}
+
+# DeepDoc specific settings (examples, expand as needed)
+DEEPDOC_LIGHTEN_MODE = False # Corresponds to LIGHTEN in RAGflow's api.settings
+DEEPDOC_PARALLEL_DEVICES = 1 # Set based on available resources, or use MAX_TASK_WORKERS
+
+# Max chunks to process from a single parser call in one task segment
+# to prevent memory issues or overly long tasks.
+MAX_CHUNKS_PER_TASK_SEGMENT = 500

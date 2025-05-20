@@ -1,4 +1,5 @@
 import os
+import json
 import uuid # For generating default KB ID if needed
 from typing import Optional, List, Dict, Any, Union, Generator, IO
 from PIL.Image import Image as PILImage
@@ -27,6 +28,16 @@ from app.services.document_service import DocumentService
 from app.utils.text_processing_utils import get_metadata_suffix, extract_blurb
 from app.config import RETURN_SEPARATOR
 import streamlit as st
+import importlib # For dynamic imports
+from app.config import PARSER_MAPPING, DEEPDOC_PARSER_BY_FILE_TYPE # Import new configs
+from app.utils.file_utils import FileType # Make sure this is your app's FileType
+# Import deepdoc parser classes for type hinting and direct use if needed
+from app.deepdoc_components.parser import (
+    RAGFlowPdfParser, RAGFlowDocxParser, RAGFlowExcelParser, RAGFlowPptParser,
+    RAGFlowTxtParser, RAGFlowMarkdownParser, RAGFlowHtmlParser, RAGFlowJsonParser
+    # Add other specific deepdoc parsers if you have them
+)
+from app.document_processing.base_parser import BaseDocumentParser # For 
 
 logger = st.logger.get_logger(__name__)
 
@@ -153,6 +164,95 @@ class AppOrchestrator:
         else:
             logger.info("No initial data path configured or path is invalid for initial ingestion.")
 
+    def _get_parser_instance(self, kb: KnowledgeBase, doc_file_type_str: str) -> Optional[BaseDocumentParser]:
+        """
+        Gets an instance of the appropriate parser based on KB settings and doc type.
+        """
+        parser_id_to_use = kb.parser_id or DEFAULT_PARSER_ID
+        
+        if parser_id_to_use == "deepdoc_auto":
+            # Dispatch to specific deepdoc parser based on file type
+            parser_key = DEEPDOC_PARSER_BY_FILE_TYPE.get(doc_file_type_str.lower())
+            if not parser_key:
+                logger.warning(f"DeepDoc Auto: No specific deepdoc parser for file type '{doc_file_type_str}'. Falling back to naive.")
+                parser_id_to_use = "naive_txtai" # Fallback
+            else:
+                parser_id_to_use = parser_key
+        
+        parser_info = PARSER_MAPPING.get(parser_id_to_use)
+
+        if not parser_info:
+            logger.error(f"No parser mapping found for parser_id: {parser_id_to_use}")
+            return None
+
+        class_path_str = parser_info.get("class_path")
+        if not class_path_str:
+            logger.error(f"Class path not defined for parser_id: {parser_id_to_use}")
+            return None
+
+        try:
+            module_path, class_name = class_path_str.rsplit('.', 1)
+            module = importlib.import_module(module_path)
+            parser_class = getattr(module, class_name)
+            
+            # Instantiate parser
+            # Deepdoc parsers might take specific init args from kb.parser_config
+            # For now, most deepdoc parsers are simple __init__ or take chunk_token_num
+            parser_init_args = {}
+            if parser_info.get("type") == "deepdoc":
+                if parser_class == RAGFlowTxtParser: # Example: RAGFlowTxtParser takes chunk_token_num
+                    txt_options = kb.parser_config.get("txt_parser_options", {})
+                    chunk_token_num = txt_options.get("chunk_token_num", DEFAULT_CHUNK_TOKEN_NUM)
+                    parser_init_args["chunk_token_num"] = chunk_token_num
+                elif parser_class == RAGFlowJsonParser:
+                    json_options = kb.parser_config.get("json_parser_options", {})
+                    max_chunk_size = json_options.get("max_chunk_size", 2000) # Default from JsonParser
+                    min_chunk_size = json_options.get("min_chunk_size")
+                    parser_init_args["max_chunk_size"] = max_chunk_size
+                    if min_chunk_size is not None:
+                         parser_init_args["min_chunk_size"] = min_chunk_size
+                # Add more specific initializations if other deepdoc parsers need them
+
+            instance = parser_class(**parser_init_args)
+            logger.info(f"Successfully instantiated parser: {class_name} for parser_id: {parser_id_to_use}")
+            return instance
+        except (ImportError, AttributeError, Exception) as e:
+            logger.error(f"Failed to instantiate parser {class_path_str}: {e}", exc_info=True)
+            return None
+    
+    def _store_artifact_image(self, kb_id: str, doc_id: str, artifact_pil_image: PILImage, artifact_type: str, original_page_num: int) -> Optional[str]:
+        """Saves an artifact image (PIL.Image) to a dedicated path and returns the path."""
+        try:
+            # Create a subdirectory for artifacts if it doesn't exist
+            # e.g., LOCAL_FILE_STORAGE_PATH / kb_id / doc_id_artifacts /
+            doc_artifact_dir = os.path.join(LOCAL_FILE_STORAGE_PATH, kb_id, f"{doc_id}_artifacts")
+            os.makedirs(doc_artifact_dir, exist_ok=True)
+
+            artifact_filename = f"{artifact_type}_{original_page_num}_{uuid.uuid4().hex}.png"
+            artifact_path = os.path.join(doc_artifact_dir, artifact_filename)
+            
+            artifact_pil_image.save(artifact_path, "PNG")
+            logger.info(f"Stored artifact image to: {artifact_path}")
+            return artifact_path # Return relative or absolute path as needed for DB
+        except Exception as e:
+            logger.error(f"Failed to store artifact image for doc {doc_id}: {e}", exc_info=True)
+            return None
+
+
+    def _create_chunk_dict(self, text_content: str, doc: Document, kb: KnowledgeBase, metadata_extras: Optional[Dict] = None) -> Dict[str, Any]:
+        """ Helper to create the dictionary structure for a chunk. """
+        chunk_data = {
+            "id": None, # Let TxtaiVectorStore generate with autoid
+            "text": text_content,
+            "doc_id": doc.id,
+            "doc_name": doc.name,
+            "kb_id": kb.id,
+            "source_file_path": doc.file_path, # Stored path, not original filename
+            "doc_title": doc.name # Simple title for now
+        }
+        if metadata_extras:
+            chunk_data.update(metadata_extras)
+        return chunk_data
 
 
     def add_document_and_trigger_processing(self,
@@ -220,185 +320,298 @@ class AppOrchestrator:
         logger.info(f"All tasks for document {doc.id} submitted to executor.")
         # Note: Overall document completion will be tracked as tasks complete.
 
-    def _execute_single_task_async(self, task_id: str):
-        """
-        The actual function that gets executed by the ThreadPoolExecutor.
-        It fetches the task, performs parsing, embedding, indexing for that task's scope.
-        """
+     def _execute_single_task_async(self, task_id: str):
         logger.info(f"[TASK_RUNNER:{task_id}] Starting execution.")
         self.task_service.update_task_status(task_id, status="processing", progress=0.01)
 
         task_db_obj = self.task_service.get_task_by_id(task_id)
-        if not task_db_obj:
-            logger.error(f"[TASK_RUNNER:{task_id}] Task not found in DB. Aborting.")
-            # No status update needed as task doesn't exist to update
+        if not task_db_obj or not doc or not kb:
+            # Logging and status updates are handled in the initial checks of this method
             return
 
-        doc = self.doc_service.get_document_by_id(task_db_obj.doc_id_id) # doc_id_id is the actual ID value
-        if not doc:
-            logger.error(f"[TASK_RUNNER:{task_id}] Document {task_db_obj.doc_id_id} not found for task. Aborting.")
+        doc = self.doc_service.get_document_by_id(task_db_obj.doc_id_id)
+        if not doc: # ... (error handling as before) ...
+            logger.error(f"[TASK_RUNNER:{task_id}] Document {task_db_obj.doc_id_id} not found. Aborting task.")
             self.task_service.update_task_status(task_id, status="failed", error_message="Associated document not found.")
-            # Check and finalize to potentially mark the document as failed if this was its only task
-            self._check_and_finalize_document_processing(task_db_obj.doc_id_id)
+            self._check_and_finalize_document_processing(task_db_obj.doc_id_id) # Check doc status
             return
 
-        kb = doc.kb_id # Access the related KnowledgeBase peewee object
-        if not kb:
-            logger.error(f"[TASK_RUNNER:{task_id}] KnowledgeBase not found for document {doc.id}. Aborting.")
+        kb = doc.kb_id
+        if not kb: # ... (error handling as before) ...
+            logger.error(f"[TASK_RUNNER:{task_id}] KnowledgeBase not found for document {doc.id}. Aborting task.")
             self.task_service.update_task_status(task_id, status="failed", error_message="Associated KnowledgeBase not found.")
             self.doc_service.update_document_status(doc.id, status="failed", error_message="KnowledgeBase not found.")
             self._check_and_finalize_document_processing(doc.id)
             return
+        
+        parser_instance = self._get_parser_instance(kb, doc.file_type)
+        if not parser_instance:
+            err_msg = f"No suitable parser found for KB config '{kb.parser_id}' and file type '{doc.file_type}'."
+            logger.error(f"[TASK_RUNNER:{task_id}] {err_msg}")
+            self.task_service.update_task_status(task_id, status="failed", error_message=err_msg)
+            self.doc_service.update_document_status(doc.id, status="failed", error_message=err_msg) # Also mark doc as failed
+            self._check_and_finalize_document_processing(doc.id)
+            return
 
         doc_file_path = doc.file_path
-        doc_title = doc.name
-        parser_config_from_kb = kb.parser_config # This includes 'pages', 'layout_recognize' etc.
-        # embed_model_name_from_kb = kb.embd_model # We use one embedder for now.
-        # --- Prepare document-level metadata for chunks ---
-        doc_metadata_for_chunks = {
-            "doc_id": doc.id,
-            "doc_name": doc.name,
-            "kb_id": kb.id,
-            "source_file_path": doc.file_path,
-            "doc_title": doc_title # Adding title explicitly
-            # Add other relevant fields from 'doc' model if needed
-        }
-
-
+        parser_config_from_kb = kb.parser_config or {} # Ensure it's a dict
         chunks_for_vector_store = []
-        total_tokens_for_task = 0
+        total_tokens_for_task = 0 # Placeholder for M2
+        task_layout_artifacts = []
         processed_successfully = False
 
         try:
-            logger.info(f"[TASK_RUNNER:{task_id}] Processing document: '{doc.name}' (ID: {doc.id}), file: {doc_file_path}")
-            logger.info(f"[TASK_RUNNER:{task_id}] Task scope: Pages {task_db_obj.from_page} to {task_db_obj.to_page}")
-            logger.info(f"[TASK_RUNNER:{task_id}] Parser config from KB: {parser_config_from_kb}")
+            logger.info(f"[TASK_RUNNER:{task_id}] Using parser: {parser_instance.__class__.__name__} for doc: '{doc.name}' (ID: {doc.id})")
+            # Use 0-indexed page numbers from the task object for processing
+            task_from_page_0_idx = task_db_obj.from_page 
+            task_to_page_0_idx = task_db_obj.to_page # This is 0-indexed inclusive, or -1 for all
 
-            # --- 1. Parse Document Content for Task Scope ---
-            # self.doc_parser is currently TxtaiDocumentParser.
-            # TxtaiDocumentParser's parse method takes a file path or URL.
-            # It doesn't directly support page ranges from its interface.
-            # DeepDoc will be better here.
-            # For now, if it's a PDF and task has page ranges, we need a workaround or accept it processes the whole file.
+            logger.info(f"[TASK_RUNNER:{task_id}] Task processing scope: Pages {task_from_page_0_idx} to {task_to_page_0_idx} (0-indexed, inclusive)")
+
+            # ... (determine parser_type as before) ...
+            current_parser_id = kb.parser_id or DEFAULT_PARSER_ID
+            if current_parser_id == "deepdoc_auto":
+                resolved_parser_key = DEEPDOC_PARSER_BY_FILE_TYPE.get(doc.file_type.lower(), "naive_txtai")
+                parser_type = PARSER_MAPPING.get(resolved_parser_key, {}).get("type", "naive")
+            else:
+                parser_type = PARSER_MAPPING.get(current_parser_id, {}).get("type", "naive")
+
+
+            if parser_type == "deepdoc":
+                # --- DeepDoc Parser Handling ---
+               
+                file_content_bytes = None # For parsers that need binary content
+                # For PDF Parser
+                if isinstance(parser_instance, RAGFlowPdfParser):
+                    pdf_options = kb.parser_config.get("pdf_parser_options", {})
+                    need_image = pdf_options.get("need_image", True) # Set to True if you want to extract images
+                    zoomin = pdf_options.get("zoomin", 3)
+                    return_html_tables = pdf_options.get("return_html_tables", True)
+                    
+                    # Pass page ranges to RAGFlowPdfParser's __call__
+                    text_sections, tables_figures = parser_instance(
+                        doc_file_path,
+                        from_page=task_from_page_0_idx,
+                        to_page=task_to_page_0_idx, # RAGFlowPdfParser's __images__ handles -1 or large numbers
+                        need_image=need_image,
+                        zoomin=zoomin,
+                        return_html=return_html_tables
+                    )
+                    for text, style in text_sections: # RAGFlowPdfParser now returns (text, style) list
+                        if text and text.strip():
+                            # The `style_info` from RAGFlowPdfParser (via __filterout_scraps) contains "@@page-x0-x1-top-bottom##"
+                            # We need to parse this tag to get coordinates and actual page number.
+                            page_meta = {}
+                            tag_match = re.search(r"@@([0-9-]+)\t([\d.]+)\t([\d.]+)\t([\d.]+)\t([\d.]+)##", style_info)
+                            if tag_match:
+                                page_str, x0, x1, top, bottom = tag_match.groups()
+                                # page_str can be "1-2-3" if content spans pages. Take the first one.
+                                actual_page_num = int(page_str.split('-')[0]) -1 # 1-indexed from tag, convert to 0-indexed
+                                page_meta = {
+                                    "original_page_number": actual_page_num, # 0-indexed absolute
+                                    "bbox_on_page": [float(x0), float(top), float(x1), float(bottom)] # Coords relative to that page
+                                }
+                                style_info = "parsed_text_section" # Replace tag with generic style
+                            
+                            chunk_metadata = {"style": style_info, "parser": "deepdoc_pdf"}
+                            chunk_metadata.update(page_meta)
+                            chunks_for_vector_store.append(self._create_chunk_dict(text, doc, kb, chunk_metadata))
+                    
+                    for image_pil, content_data in tables_figures: # Process 
+                        text_representation = ""
+                        is_table = False
+                        artifact_type_str = "figure" # Default
+                        item_page_meta = {}
+                        # Try to extract positional tag from content_data if it's a list of strings
+                        # or from the text_representation if it's a string
+                        raw_text_for_tag = ""
+                        if isinstance(content_data, list) and content_data:
+                            raw_text_for_tag = content_data[0] # Assume tag is in the first caption line
+                        elif isinstance(content_data, str):
+                            raw_text_for_tag = content_data 
+                        
+                        tag_match_item = re.search(r"@@([0-9-]+)\t([\d.]+)\t([\d.]+)\t([\d.]+)\t([\d.]+)##", raw_text_for_tag)
+                        if tag_match_item:
+                            page_str_item, x0_item, x1_item, top_item, bottom_item = tag_match_item.groups()
+                            actual_page_num_item = int(page_str_item.split('-')[0]) -1 # 0-indexed absolute
+                            item_page_meta = {
+                                "original_page_number": actual_page_num_item,
+                                "bbox_on_page": [float(x0_item), float(top_item), float(x1_item), float(bottom_item)]
+                            }
+                            # Clean the tag from content_data
+                            if isinstance(content_data, list):
+                                content_data = [parser_instance.remove_tag(t) for t in content_data]
+                            elif isinstance(content_data, str):
+                                content_data = parser_instance.remove_tag(content_data)
+                        
+                        # Prepare text and determine type
+                        if isinstance(content_data, list): # Usually figure captions
+                            text_representation = " ".join(content_data)
+                            artifact_type_str = "figure"
+                        elif isinstance(content_data, str): # Usually HTML table
+                            import html2text 
+                            h_converter = html2text.HTML2Text()
+                            h_converter.ignore_links = True; h_converter.ignore_images = True
+                            text_representation = h_converter.handle(content_data)
+                            is_table = True
+                            artifact_type_str = "table"
+                        
+                        stored_image_path = None
+                        if need_image and image_pil and item_page_meta.get("original_page_number") is not None:
+                            stored_image_path = self._store_artifact_image(
+                                kb.id, doc.id, image_pil, artifact_type_str, item_page_meta["original_page_number"]
+                            )
+                        
+                        # Add to layout_artifacts for Document DB field
+                        artifact_record = {
+                            "type": artifact_type_str,
+                            "page": item_page_meta.get("original_page_number"),
+                            "bbox": item_page_meta.get("bbox_on_page"),
+                            "stored_image_path": stored_image_path, # Path to the PNG/JPG on disk
+                            "text_content_preview": (text_representation[:200] + "...") if len(text_representation) > 200 else text_representation,
+                        }
+                        if is_table and return_html_tables and isinstance(content_data, str): # Store original HTML for tables
+                            artifact_record["html_content"] = content_data
+                        task_layout_artifacts.append(artifact_record)
+
+                        # Add text representation to vector store
+                        if text_representation.strip():
+                            chunk_meta = {"parser": f"deepdoc_pdf_{artifact_type_str}"}
+                            chunk_meta.update(item_page_meta)
+                            chunk_meta["is_table_or_figure"] = True
+                            chunk_meta["artifact_image_path"] = stored_image_path
+                            chunks_for_vector_store.append(self._create_chunk_dict(text_representation, doc, kb, chunk_meta))
+
+                elif isinstance(parser_instance, RAGFlowDocxParser):
+                    # RAGFlowDocxParser takes from_page, to_page in __call__
+                    secs, tbls = parser_instance(
+                        doc_file_path, 
+                        from_page=task_from_page_0_idx, # DocxParser uses 0-indexed
+                        to_page=task_to_page_0_idx if task_to_page_0_idx != -1 else 100000000 # Max pages
+                    )
+                    for text, style in secs:
+                         chunk_metadata = {"style": style, "parser": "deepdoc_docx"}
+                        # Add page scope information if meaningful
+                        if task_from_page_0_idx != 0 or task_to_page_0_idx != -1:
+                             chunk_metadata["page_scope"] = f"{task_from_page_0_idx}-{task_to_page_0_idx}"
+                        if text and text.strip():
+                            chunks_for_vector_store.append(self._create_chunk_dict(text, doc, kb, chunk_metadata))
+                    for i, table_lines_list in enumerate(tbls):
+                        table_text = "\n".join(table_lines_list)
+                        if table_text.strip():
+                            chunk_metadata = {"is_table": True, "parser": "deepdoc_docx_table"}
+                            if task_from_page_0_idx != 0 or task_to_page_0_idx != -1:
+                                 chunk_metadata["page_scope"] = f"{task_from_page_0_idx}-{task_to_page_0_idx}"
+                            chunks_for_vector_store.append(self._create_chunk_dict(f"Table Content {i+1}:\n{table_text}", doc, kb, chunk_metadata))
+                            task_layout_artifacts.append({
+                                "type": "table_text",
+                                # "page": ? needs more info from docx parser if available
+                                "text_content_preview": (table_text[:200] + "...") if len(table_text) > 200 else table_text,
+                            })
+
+                
+                elif isinstance(parser_instance, RAGFlowPptParser):
+                    slide_texts = parser_instance(
+                        doc_file_path, 
+                        from_page=task_from_page_0_idx, # PptParser uses 0-indexed
+                        to_page=task_to_page_0_idx if task_to_page_0_idx != -1 else 100000000 # Max slides
+                    )
+                    # ... (process slide_texts as before) ...
+                    for slide_text in slide_texts:
+                        if slide_text and slide_text.strip():
+                            chunks_for_vector_store.append(self._create_chunk_dict(slide_text, doc, kb, {"parser": "deepdoc_ppt"}))
+                    
+                elif isinstance(parser_instance, (RAGFlowTxtParser, RAGFlowMarkdownParser, RAGFlowHtmlParser, RAGFlowJsonParser, RAGFlowExcelParser)):
+                    # These parsers have varied __call__ signatures.
+                    # Some take `binary` content, some take `fnm`.
+                    # Some return list of strings, some list of (text, style), some structured.
+                    # This requires careful adaptation for each.
+                    
+                    # General strategy: Read file as bytes, pass to parser if it expects `binary`.
+                    file_content_bytes = None
+                    try:
+                        with open(doc_file_path, "rb") as f_bin:
+                            file_content_bytes = f_bin.read()
+                    except Exception as e_read:
+                        raise RuntimeError(f"Could not read file {doc_file_path} for deepdoc parser: {e_read}")
+
+                    if isinstance(parser_instance, RAGFlowTxtParser):
+                        if file_content_bytes is None: # Load if not already for other parsers
+                        with open(doc_file_path, "rb") as f_bin: 
+                            file_content_bytes = f_bin.read()
+                        txt_options = parser_config_from_kb.get("txt_parser_options", {})
+                        delimiter = txt_options.get("delimiter", DEFAULT_CHUNK_DELIMITER)
+                        parsed_output = parser_instance(doc_file_path, binary=file_content_bytes, delimiter=delimiter)
+                        for text, _ in parsed_output:
+                            if text and text.strip(): chunks_for_vector_store.append(self._create_chunk_dict(text, doc, kb, {"parser": "deepdoc_txt"}))
+                    
+                    elif isinstance(parser_instance, RAGFlowMarkdownParser):
+                        if file_content_bytes is None:
+                            with open(doc_file_path, "rb") as f_bin: file_content_bytes = f_bin.read()
+                        md_text_content = file_content_bytes.decode(find_codec(file_content_bytes) or 'utf-8')
+                        remainder_text, tables_str_list = parser_instance.extract_tables_and_remainder(md_text_content)
+                        if remainder_text.strip(): chunks_for_vector_store.append(self._create_chunk_dict(remainder_text, doc, kb, {"parser": "deepdoc_md"}))
+                        for table_str in tables_str_list:
+                            if table_str.strip(): chunks_for_vector_store.append(self._create_chunk_dict(f"Table Content:\n{table_str}", doc, kb, {"is_table": True, "parser": "deepdoc_md_table"}))
+
+                    elif isinstance(parser_instance, RAGFlowHtmlParser):
+                    if file_content_bytes is None:
+                        with open(doc_file_path, "rb") as f_bin: file_content_bytes = f_bin.read()
+                    sections = parser_instance(doc_file_path, binary=file_content_bytes)
+                    for section_text in sections:
+                        if section_text and section_text.strip(): chunks_for_vector_store.append(self._create_chunk_dict(section_text, doc, kb, {"parser": "deepdoc_html"}))
+
+                elif isinstance(parser_instance, RAGFlowJsonParser):
+                    if file_content_bytes is None:
+                        with open(doc_file_path, "rb") as f_bin: file_content_bytes = f_bin.read()
+                    sections = parser_instance(file_content_bytes)
+                    for json_chunk_str in sections:
+                        if json_chunk_str and json_chunk_str.strip(): chunks_for_vector_store.append(self._create_chunk_dict(json_chunk_str, doc, kb, {"parser": "deepdoc_json", "content_type": "json_chunk"}))
+
+                elif isinstance(parser_instance, RAGFlowExcelParser):
+                    # Excel parser does not take page ranges
+                    excel_options = parser_config_from_kb.get("excel_parser_options", {})
+                    use_html_output = excel_options.get("use_html_output", False)
+                    if use_html_output:
+                        html_chunks = parser_instance.html(doc_file_path) 
+                        for html_table_chunk in html_chunks:
+                            import html2text
+                            h_converter = html2text.HTML2Text(); h_converter.ignore_links = True; h_converter.ignore_images = True
+                            text_representation = h_converter.handle(html_table_chunk)
+                            if text_representation.strip(): chunks_for_vector_store.append(self._create_chunk_dict(text_representation, doc, kb, {"parser": "deepdoc_excel_html_table"}))
+                    else:
+                        row_texts = parser_instance(doc_file_path)
+                        for row_text in row_texts:
+                            if row_text and row_text.strip(): chunks_for_vector_store.append(self._create_chunk_dict(row_text, doc, kb, {"parser": "deepdoc_excel_row"}))
+                else:
+                    logger.error(f"[TASK_RUNNER:{task_id}] Unhandled deepdoc parser type: {parser_instance.__class__.__name__}")
+                    raise NotImplementedError(f"Deepdoc parser {parser_instance.__class__.__name__} output handling not implemented.")
+
+            else: # Naive TxtaiDocumentParser (not page-aware)
+                # This branch should only be hit if this is the *only* task for this document,
+                # or if page-aware logic in TaskService decided to create a single task.
+                if task_from_page_0_idx != 0 or task_to_page_0_idx != -1:
+                     logger.warning(f"[TASK_RUNNER:{task_id}] Non-page-aware parser '{parser_instance.__class__.__name__}' received a page-scoped task. "
+                                   f"It will process the entire document. Task page range: {task_from_page_0_idx}-{task_to_page_0_idx}. "
+                                   f"Ensure TaskService creates only one task for such (parser, file_type) combinations to avoid duplication.")
+                
+                parsed_content_generator = parser_instance.parse(doc_file_path)
+                for content_dict in parsed_content_generator:
+                    text_content = content_dict.get("text")
+                    source_info = content_dict.get("source") 
+                    if text_content and text_content.strip():
+                        chunks_for_vector_store.append(self._create_chunk_dict(text_content, doc, kb, {"original_source_tag": source_info, "parser": "naive_txtai"}))
             
-            # TODO: Enhance self.doc_parser interface or implementations to accept task_scope (pages, etc.)
-            # For TxtaiDocumentParser, it currently processes the whole file.
-            # If DeepDoc is used, it would handle page ranges internally or via its API.
-            
-            # Simple simulation for now:
-            # If it's a PDF and from_page != 0 or to_page != -1, it's a sub-task.
-            # Our current TxtaiDocumentParser will re-parse the whole doc for each such task.
-            # This is inefficient but a limitation of not having a page-aware parser interface yet.
-            
-            parsed_content_generator = self.doc_parser.parse(doc_file_path)
-            # TxtaiDocumentParser yields dicts like {"text": "...", "source": "filepath"}
-
-            # We need to simulate page filtering if task_db_obj specifies pages
-            # This is a very rough simulation for PDF. A real solution needs parser support.
-            current_chunk_index_in_doc = 0 # To generate unique chunk IDs for this document
-            # Max chunks per task to avoid overwhelming memory or a single task taking too long.
-            MAX_CHUNKS_PER_TASK_SEGMENT = 500 # Configurable
-
-            for i, content_dict in enumerate(parsed_content_generator):
-                # Rough page filtering (INEFFICIENT - re-parses all for each task)
-                # This needs to be handled by the parser itself ideally.
-                # If task is for specific pages of a PDF, and current parser doesn't support it,
-                # this loop processes all chunks from the doc. We'll add all and let txtai index them.
-                # The task definition (from_page, to_page) is more for future page-aware parsers.
-                
-                # For now, we process all chunks yielded by the parser for the given file.
-                # If this task is one of many for a PDF (e.g. task 1 for p0-9, task 2 for p10-19),
-                # this code will add *all* chunks from the PDF to the vector store *for each task*.
-                # This is a major duplication and needs to be fixed when DeepDoc or a page-aware
-                # parser is integrated.
-                #
-                # Workaround idea for TxtaiDocumentParser if tasks represent full doc:
-                # Only process if task.from_page == 0 and task.to_page == -1
-                # if not (doc.file_type == FileType.PDF.value and (task_db_obj.from_page != 0 or task_db_obj.to_page != -1)):
-                #    # This is not a sub-page task for a PDF, or not a PDF, so process all content from parser
-                #    pass # continue processing this content_dict
-                # else:
-                #    # This IS a sub-page task for a PDF. Our current parser CANNOT handle this.
-                #    # So we skip adding chunks to avoid duplication if multiple tasks exist for this PDF.
-                #    # The *first* task (e.g. pages 0 to -1, or 0 to N) would process it.
-                #    # This is still a hack.
-                #    logger.warning(f"[TASK_RUNNER:{task_id}] PDF sub-page task. Current parser processes whole file. "
-                #                   f"Skipping chunk addition in this task to avoid duplication if other tasks cover it.")
-                #    # To make this workaround function, we'd need to ensure only ONE task for a PDF
-                #    # actually processes content if the parser isn't page-aware.
-                #    # For now, let's assume the task creation logic for PDF with TxtaiParser
-                #    # only creates ONE task (from_page=0, to_page=-1).
-                #    # If TaskService.create_processing_tasks_for_document for PDF and TxtaiParser
-                #    # creates multiple tasks, then we have a duplication problem here.
-                #
-                # Let's assume `TaskService.create_processing_tasks_for_document` is smart enough for now
-                # for the current `TxtaiDocumentParser` to only create one task if the parser isn't page-aware.
-                # (Review TaskService: it does create one task if not PDF with page ranges/size in config)
-
-                text_content = content_dict.get("text")
-                if not text_content or not text_content.strip():
-                    continue
-
-                # Estimate tokens (simple split, not accurate as model tokenizer)
-                # TODO: Use self.embedder.tokenizer if available for better token count
-                total_tokens_for_task += len(text_content.split())
-                
-                # --- Chunk ID generation ---
-                # We need a unique ID for each chunk within the txtai vector store.
-                # Format: <doc_id>_chunk_<index_within_doc>
-                # This requires knowing the global chunk index for this document across all its tasks.
-                # This is hard with parallel tasks.
-                # Alternative: <task_id>_chunk_<index_within_task> - simpler, but less globally unique for doc.
-                # Best: <doc_id>_chunk_<sequential_number_for_doc>
-                # For now, use UUID for chunk ID for simplicity with txtai's autoid="uuid5"
-                # TxtaiVectorStore's add_documents will handle ID generation if `doc.get("id")` is None.
-                # To link back, we need to store the `doc_id` as metadata in the chunk.
-                
-                # Onyx: `DocAwareChunk` with `chunk_id` (sequential within doc).
-                # We can simulate this by querying current chunk_count for the doc before adding.
-                # But this is prone to race conditions.
-                # Safest for now: let txtai generate chunk ID, store doc_id and kb_id as metadata.
-
-                chunk_data_for_txtai = {
-                    "id": None, # Let TxtaiVectorStore generate with autoid="uuid5"
-                    "text": text_content,
-                    # --- METADATA ---
-                    # Crucial for filtering, context, and linking back
-                    "doc_id": doc.id,
-                    "doc_name": doc.name,
-                    "kb_id": kb.id,
-                    "source_file_path": doc_file_path, # Original source of the document
-                    # "chunk_source_info": f"Task_{task_id}_Index_{i}" # For debugging linkage
-                    # Add more metadata from Onyx ideas later: title, summaries, etc.
-                }
-                chunks_for_vector_store.append(chunk_data_for_txtai)
-                
-                if len(chunks_for_vector_store) % 50 == 0: # Log progress
-                    logger.debug(f"[TASK_RUNNER:{task_id}] Parsed {len(chunks_for_vector_store)} chunks so far...")
-                
-                if len(chunks_for_vector_store) >= MAX_CHUNKS_PER_TASK_SEGMENT:
-                    logger.warning(f"[TASK_RUNNER:{task_id}] Reached max chunks ({MAX_CHUNKS_PER_TASK_SEGMENT}) for this task segment. Processing what we have.")
-                    break # Stop parsing more for this specific task to prevent memory issues
-
             self.task_service.update_task_status(task_id, status="processing", progress=0.3)
             logger.info(f"[TASK_RUNNER:{task_id}] Parsed {len(chunks_for_vector_store)} chunks from '{doc.name}'.")
 
-            # --- 2. Embed Chunks (if any) ---
-            # TxtaiVectorStore handles embedding internally if embeddings are not provided to add_documents.
-            # So, we don't explicitly call self.embedder here if TxtaiVectorStore is used.
-            # If we were to use a vector store that requires pre-computed embeddings:
-            #   if chunks_for_vector_store:
-            #       texts_to_embed = [c["text"] for c in chunks_for_vector_store]
-            #       embeddings = self.embedder.get_embeddings(texts_to_embed)
-            #       for i, chunk in enumerate(chunks_for_vector_store):
-            #           chunk["embedding"] = embeddings[i] # Add precomputed embedding
-            #       self.task_service.update_task_status(task_id, status="processing", progress=0.6)
-
-            # --- 3. Add Chunks to Vector Store (txtai) ---
             if chunks_for_vector_store:
+                if len(chunks_for_vector_store) > MAX_CHUNKS_PER_TASK_SEGMENT:
+                    logger.warning(f"[TASK_RUNNER:{task_id}] Task produced {len(chunks_for_vector_store)} chunks, "
+                                   f"truncating to {MAX_CHUNKS_PER_TASK_SEGMENT} for this segment.")
+                    chunks_for_vector_store = chunks_for_vector_store[:MAX_CHUNKS_PER_TASK_SEGMENT]
+                
                 logger.info(f"[TASK_RUNNER:{task_id}] Adding {len(chunks_for_vector_store)} chunks to TxtaiVectorStore.")
-                # TxtaiVectorStore.add_documents will use its configured embedding model.
-                # The "id" in chunk_data_for_txtai is None, so txtai will autogenerate one.
                 self.vector_store.add_documents(chunks_for_vector_store)
                 logger.info(f"[TASK_RUNNER:{task_id}] Successfully added chunks to vector store.")
             else:
@@ -408,26 +621,42 @@ class AppOrchestrator:
             processed_successfully = True
 
         except Exception as e:
-            error_msg = f"Error during task execution for task {task_id} (Doc: {doc.id}): {e}"
+            error_msg = f"Error during task execution for task {task_id} (Doc: {doc.id}, Parser: {parser_instance.__class__.__name__ if parser_instance else 'N/A'}): {e}"
             logger.error(f"[TASK_RUNNER:{task_id}] {error_msg}", exc_info=True)
             self.task_service.update_task_status(task_id, status="failed", error_message=str(e))
-            # No need to update document status here, _check_and_finalize will handle it
-
+        
         finally:
-            # --- 4. Update Task and Document Status ---
             if processed_successfully:
                 self.task_service.update_task_status(task_id, status="completed", progress=1.0)
-                # Increment document's overall chunk/token count
+                estimated_tokens = sum(len(c.get("text","").split()) for c in chunks_for_vector_store) # Placeholder for M2
                 self.doc_service.increment_document_chunk_and_token_count(
                     doc.id,
                     chunk_increment=len(chunks_for_vector_store),
-                    token_increment=total_tokens_for_task # This is an estimate
+                    token_increment=estimated_tokens 
                 )
                 logger.info(f"[TASK_RUNNER:{task_id}] Task completed successfully.")
+                if task_layout_artifacts:
+                        try:
+                            # If doc.layout_analysis_results already has data (e.g. from another task for same doc),
+                            # you might want to merge instead of overwrite.
+                            # For simplicity in C4, this example overwrites if it's the first task,
+                            # or appends if data already exists (assuming list format).
+                            
+                            # Fetch current doc layout results
+                            current_doc_obj = self.doc_service.get_document_by_id(doc.id) # Get fresh instance
+                            if current_doc_obj:
+                                existing_artifacts = current_doc_obj.layout_analysis_results or []
+                                if not isinstance(existing_artifacts, list): existing_artifacts = []
+                                
+                                updated_artifacts = existing_artifacts + task_layout_artifacts
+                                
+                                current_doc_obj.layout_analysis_results = updated_artifacts
+                                current_doc_obj.save()
+                                logger.info(f"[TASK_RUNNER:{task_id}] Updated Document.layout_analysis_results for doc {doc.id} with {len(task_layout_artifacts)} new artifacts.")
+                        except Exception as e_save_layout:
+                            logger.error(f"[TASK_RUNNER:{task_id}] Failed to save layout_analysis_results for doc {doc.id}: {e_save_layout}")
             
-            # This will check if all tasks for the doc are done and update doc status,
-            # potentially triggering GraphRAG topic inference and vector store persistence.
-            self._check_and_finalize_document_processing(doc.id)
+            self._check_and_finalize_document_processing(doc.id) # This checks all tasks for the doc
             logger.info(f"[TASK_RUNNER:{task_id}] Finished execution.")
 
 
@@ -512,25 +741,19 @@ class AppOrchestrator:
                 
                 if self.graph_builder:
                     logger.info(f"Running GraphRAG topic inference for completed document {doc_id}...")
-                    # infer_topics_for_all_nodes is too broad.
-                    # We need a way to tell it to process nodes related to this specific doc_id.
-                    # For now, we call the general one, but this needs refinement for efficiency.
-                    # A better way: GraphRAGBuilder.infer_topics_for_document_nodes(doc_id, self.vector_store)
-                    self.graph_builder.infer_topics_for_all_nodes() # Inefficient, but for now
+                    self.graph_builder.infer_topics_for_all_nodes() 
                     logger.info(f"GraphRAG topic inference triggered for document {doc_id}.")
-
-                # --- Persist TxtaiVectorStore if changes were made ---
                 if PERSIST_DB_PATH and self.vector_store:
-                    logger.info(f"Persisting TxtaiVectorStore after document {doc_id} processing.")
+                    logger.info(f"Persisting TxtaiVectorStore after document {doc.id} processing.")
                     self.vector_store.save(PERSIST_DB_PATH)
         else:
             # Update overall document progress based on completed tasks
             all_tasks_for_doc = self.task_service.get_tasks_for_document(doc_id)
             if all_tasks_for_doc:
                 completed_progress_sum = sum(t.progress for t in all_tasks_for_doc if t.status == "completed")
-                current_processing_progress = sum(t.progress for t in all_tasks_for_doc if t.status == "processing") * 0.5 # Assume processing tasks are 50% of their reported progress
-                total_tasks = len(all_tasks_for_doc)
-                overall_doc_progress = (completed_progress_sum + current_processing_progress) / total_tasks
+                current_processing_progress = sum(t.progress for t in all_tasks_for_doc if t.status == "processing") * 0.5 
+                total_tasks_count = len(all_tasks_for_doc)
+                overall_doc_progress = (completed_progress_sum + current_processing_progress) / total_tasks_count if total_tasks_count > 0 else 0.0
                 self.doc_service.update_document_status(doc.id, status="processing", progress=min(overall_doc_progress, 0.99))
 
 

@@ -15,7 +15,7 @@
 #  limitations under the License.
 #
 
-from rag.nlp import find_codec
+from app.utils.rag_nlp_stubs import find_codec
 import readability
 import html_text
 import chardet

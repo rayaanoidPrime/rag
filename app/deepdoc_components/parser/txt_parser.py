@@ -16,8 +16,8 @@
 
 import re
 
-from deepdoc.parser.utils import get_text
-from rag.nlp import num_tokens_from_string
+from app.deepdoc_components.parser.utils import get_text
+from app.utils.rag_nlp_stubs import num_tokens_from_string
 
 
 class RAGFlowTxtParser:

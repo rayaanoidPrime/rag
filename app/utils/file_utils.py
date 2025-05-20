@@ -11,14 +11,9 @@ class FileType(Enum):
     CSV = "csv"
     HTML = "html"
     HTM = "htm"
-    # Add more image types if DeepDoc or other parsers handle them as primary docs
     PNG = "png"
     JPG = "jpg"
     JPEG = "jpeg"
-    # Audio/Video if needed later
-    # MP3 = "mp3"
-    # WAV = "wav"
-    # MP4 = "mp4"
     OTHER = "other"
 
 KNOWN_EXTENSIONS = {
@@ -44,23 +39,28 @@ def get_file_type(filename: str) -> FileType:
     return KNOWN_EXTENSIONS.get(ext.lower(), FileType.OTHER)
 
 def generate_safe_filename(kb_id: str, original_filename: str) -> str:
-    """
-    Generates a unique and safe filename for storage.
-    Example: <kb_id>_<timestamp>_<original_filename_sanitized>
-    This is a simple version; RAGflow's `duplicate_name` checked DB.
-    For local storage, ensuring uniqueness within the KB's folder is key.
-    """
+    # ... (existing function)
     import time
     import re
     
     timestamp = int(time.time())
-    # Sanitize original filename: remove special chars, limit length
     sanitized_name = re.sub(r'[^\w\-\.]', '_', original_filename)
-    sanitized_name = sanitized_name[:50] # Limit length of original name part
-    
-    # This doesn't guarantee global uniqueness if called rapidly,
-    # but for single user, combined with kb_id folder, it's often sufficient.
-    # A more robust way would be UUIDs for filenames.
-    # RAGflow checked against existing names in DB for that KB.
-    # For now, we'll just prefix. The actual stored path will be in DB.
+    sanitized_name = sanitized_name[:50] 
     return f"{timestamp}_{sanitized_name}"
+
+def get_pdf_page_count(file_path: str) -> int:
+    """
+    Gets the total number of pages in a PDF file.
+    Returns 0 if the file is not a PDF or an error occurs.
+    """
+    if not file_path.lower().endswith(".pdf"):
+        return 0
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            return len(pdf.pages)
+    except Exception as e:
+        # Consider logging this error
+        # import logging
+        # logging.error(f"Could not get page count for PDF {file_path}: {e}")
+        print(f"Warning: Could not get page count for PDF {file_path}: {e}") # Use print if logger not set up here
+        return 0 # Or raise an error if page count is critical

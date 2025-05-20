@@ -5,7 +5,28 @@ autoawq; platform_machine == "x86_64" or platform_machine == "AMD64"
 matplotlib
 streamlit
 txtai[graph,pipeline-data,pipeline-llm,similarity]
-torch
 Pillow
 networkx
 python-dotenv
+# In requirements.txt, add or ensure these exist:
+# ... (existing requirements like streamlit, txtai, etc.)
+python-docx
+openpyxl
+python-pptx
+pdfplumber
+Pillow
+opencv-python
+scikit-learn 
+# (xgboost is the actual library for the .model file, ensure it's compatible or if sklearn can load it)
+# If xgboost model is used, you'll need xgboost library:
+# xgboost
+pyclipper
+shapely
+huggingface_hub
+# torch, torchvision, torchaudio (often via txtai)
+readability-lxml
+html_text
+chardet
+nltk
+datrie # For Huqie tokenizer
+hanziconv # For Huqie tokenizer
